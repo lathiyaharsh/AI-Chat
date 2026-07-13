@@ -14,7 +14,8 @@ export type ChatStreamEvent =
 
 /** Read the fetch response body and yield parsed SSE events one by one. */
 export async function* readChatStream(
-  response: Response
+  response: Response,
+  signal?: AbortSignal
 ): AsyncGenerator<ChatStreamEvent> {
   if (!response.body) {
     throw new Error("No response body");
@@ -24,8 +25,18 @@ export async function* readChatStream(
   const decoder = new TextDecoder();
   let buffer = "";
 
+  const abortReader = () => {
+    reader.cancel().catch(() => {
+      // Ignore cancel errors when the stream is already closed.
+    });
+  };
+
+  signal?.addEventListener("abort", abortReader);
+
   try {
     while (true) {
+      if (signal?.aborted) break;
+
       const { done, value } = await reader.read();
       if (done) break;
 
@@ -49,6 +60,7 @@ export async function* readChatStream(
       }
     }
   } finally {
+    signal?.removeEventListener("abort", abortReader);
     reader.releaseLock();
   }
 }

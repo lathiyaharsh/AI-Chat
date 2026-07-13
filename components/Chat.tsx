@@ -12,8 +12,7 @@
 
 import Image from "next/image";
 import { useEffect, useRef, useState } from "react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
+import MarkdownContent from "@/components/MarkdownContent";
 import type { AIProvider, ChatMessage } from "@/lib/ai/types";
 import { getProviderLabel } from "@/lib/ai/types";
 import {
@@ -21,6 +20,7 @@ import {
   loadStoredChat,
   saveStoredChat,
 } from "@/lib/chat-storage";
+import { downloadChat } from "@/lib/export-chat";
 import { readChatStream } from "@/lib/sse-client";
 
 const ASSISTANT_AVATAR = "/assistant-avatar.svg";
@@ -52,6 +52,28 @@ function TypingIndicator() {
         <span className="typing-dot h-2 w-2 rounded-full bg-[var(--color-text-muted)]" />
       </div>
     </div>
+  );
+}
+
+/** Small text action button used under assistant messages. */
+function MessageActionButton({
+  label,
+  onClick,
+  disabled,
+}: {
+  label: string;
+  onClick: () => void;
+  disabled?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      className="rounded-[var(--radius-sm)] px-2 py-1 text-xs text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-surface-elevated)] hover:text-[var(--color-text)] disabled:cursor-not-allowed disabled:opacity-50"
+    >
+      {label}
+    </button>
   );
 }
 
@@ -105,20 +127,22 @@ function MessageContent({
     );
   }
 
-  return (
-    <div className="chat-markdown">
-      <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
-    </div>
-  );
+  return <MarkdownContent content={content} />;
 }
 
 /** Renders one chat bubble (user or assistant). */
 function MessageBubble({
   message,
   isStreaming,
+  showRegenerate,
+  onRegenerate,
+  actionsDisabled,
 }: {
   message: ChatMessage;
   isStreaming?: boolean;
+  showRegenerate?: boolean;
+  onRegenerate?: () => void;
+  actionsDisabled?: boolean;
 }) {
   const isUser = message.role === "user";
 
@@ -142,8 +166,15 @@ function MessageBubble({
           />
         </div>
         {!isUser && message.content && !isStreaming && (
-          <div className="flex justify-start pl-1">
+          <div className="flex justify-start gap-1 pl-1">
             <CopyButton text={message.content} />
+            {showRegenerate && onRegenerate && (
+              <MessageActionButton
+                label="Regenerate"
+                onClick={onRegenerate}
+                disabled={actionsDisabled}
+              />
+            )}
           </div>
         )}
       </div>
@@ -210,6 +241,74 @@ function SuggestionChip({
     >
       {text}
     </button>
+  );
+}
+
+/** Download chat history as .md or .txt. */
+function ExportMenu({
+  messages,
+  disabled,
+}: {
+  messages: ChatMessage[];
+  disabled?: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+
+    const handleClickOutside = (event: MouseEvent) => {
+      if (!menuRef.current?.contains(event.target as Node)) {
+        setOpen(false);
+      }
+    };
+
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, [open]);
+
+  const handleExport = (format: "md" | "txt") => {
+    downloadChat(messages, format);
+    setOpen(false);
+  };
+
+  return (
+    <div className="relative" ref={menuRef}>
+      <button
+        type="button"
+        onClick={() => setOpen((value) => !value)}
+        disabled={disabled}
+        aria-expanded={open}
+        aria-haspopup="menu"
+        className="rounded-[var(--radius-sm)] px-3 py-1.5 text-sm text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-surface-elevated)] hover:text-[var(--color-text)] disabled:cursor-not-allowed disabled:opacity-50"
+      >
+        Export
+      </button>
+      {open && (
+        <div
+          role="menu"
+          className="absolute right-0 top-full z-10 mt-1 min-w-[10rem] rounded-[var(--radius-sm)] border border-[var(--color-border)] bg-[var(--color-surface-elevated)] py-1 shadow-lg"
+        >
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => handleExport("md")}
+            className="block w-full px-3 py-2 text-left text-sm text-[var(--color-text)] hover:bg-[var(--color-surface)]"
+          >
+            Markdown (.md)
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => handleExport("txt")}
+            className="block w-full px-3 py-2 text-left text-sm text-[var(--color-text)] hover:bg-[var(--color-surface)]"
+          >
+            Plain text (.txt)
+          </button>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -307,10 +406,13 @@ export default function Chat({
     useState<AIProvider>(defaultProvider);
   const [conciseMode, setConciseMode] = useState(false);
   const [hydrated, setHydrated] = useState(false); // localStorage loaded
+  const [canRetry, setCanRetry] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const pendingStreamRef = useRef(""); // buffer for incoming stream chunks
   const flushStreamRef = useRef<number | null>(null); // requestAnimationFrame id
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const retryMessagesRef = useRef<ChatMessage[] | null>(null);
 
   // Load saved chat from localStorage after the component mounts in the browser.
   useEffect(() => {
@@ -375,26 +477,41 @@ export default function Chat({
     });
   };
 
-  /** Send a user message to the backend and stream the assistant reply. */
-  const sendMessage = async (text: string) => {
-    const trimmed = text.trim();
-    if (!trimmed || isLoading) return;
+  const cancelStreamAnimation = () => {
+    if (flushStreamRef.current !== null) {
+      window.cancelAnimationFrame(flushStreamRef.current);
+      flushStreamRef.current = null;
+    }
+  };
 
-    const userMessage: ChatMessage = { role: "user", content: trimmed };
-    const updatedMessages = [...messages, userMessage];
+  const removeEmptyAssistantMessage = (prev: ChatMessage[]) => {
+    const last = prev[prev.length - 1];
+    if (last?.role === "assistant" && !last.content.trim()) {
+      return prev.slice(0, -1);
+    }
+    return prev;
+  };
 
-    setMessages(updatedMessages);
-    setInput("");
+  /** Core streaming request — used by send, retry, and regenerate. */
+  const executeChatRequest = async (chatMessages: ChatMessage[]) => {
+    if (isLoading) return;
+
     setError(null);
+    setCanRetry(false);
     setIsLoading(true);
     setIsStreaming(false);
+    retryMessagesRef.current = chatMessages;
+
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
 
     try {
       const response = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: controller.signal,
         body: JSON.stringify({
-          messages: updatedMessages,
+          messages: chatMessages,
           stream: true,
           concise: conciseMode,
           ...(allowProviderSwitch ? { provider: selectedProvider } : {}),
@@ -409,14 +526,14 @@ export default function Chat({
         }
       }
 
-      // Create an empty assistant message first, then fill it as chunks arrive.
       setMessages((prev) => [...prev, { role: "assistant", content: "" }]);
       setIsStreaming(true);
 
       let streamError: string | null = null;
 
-      // Read SSE events from the response body.
-      for await (const event of readChatStream(response)) {
+      for await (const event of readChatStream(response, controller.signal)) {
+        if (controller.signal.aborted) break;
+
         if (event.type === "meta") {
           setActiveProvider(event.provider);
         }
@@ -434,14 +551,17 @@ export default function Chat({
         }
       }
 
-      if (flushStreamRef.current !== null) {
-        window.cancelAnimationFrame(flushStreamRef.current);
-        flushStreamRef.current = null;
+      cancelStreamAnimation();
+
+      if (controller.signal.aborted) {
+        flushStreamBuffer();
+        setMessages(removeEmptyAssistantMessage);
+        return;
       }
+
       flushStreamBuffer();
 
       if (streamError) {
-        // Remove empty assistant bubble if the stream failed.
         setMessages((prev) => {
           const next = [...prev];
           const last = next[next.length - 1];
@@ -453,18 +573,16 @@ export default function Chat({
         throw new Error(streamError);
       }
 
-      setMessages((prev) => {
-        const next = [...prev];
-        const last = next[next.length - 1];
-        if (last?.role === "assistant" && !last.content.trim()) {
-          return next.slice(0, -1);
-        }
-        return next;
-      });
+      setMessages(removeEmptyAssistantMessage);
     } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") {
+        return;
+      }
+
       const message =
         err instanceof Error ? err.message : "Failed to get a response";
       setError(message);
+      setCanRetry(true);
       setMessages((prev) => {
         const last = prev[prev.length - 1];
         if (last?.role === "assistant" && !last.content) {
@@ -473,10 +591,67 @@ export default function Chat({
         return prev;
       });
     } finally {
+      abortControllerRef.current = null;
       setIsLoading(false);
       setIsStreaming(false);
       inputRef.current?.focus();
     }
+  };
+
+  /** Send a user message to the backend and stream the assistant reply. */
+  const sendMessage = async (text: string) => {
+    const trimmed = text.trim();
+    if (!trimmed || isLoading) return;
+
+    const userMessage: ChatMessage = { role: "user", content: trimmed };
+    const updatedMessages = [...messages, userMessage];
+
+    setMessages(updatedMessages);
+    setInput("");
+    await executeChatRequest(updatedMessages);
+  };
+
+  const stopGeneration = () => {
+    abortControllerRef.current?.abort();
+    cancelStreamAnimation();
+    flushStreamBuffer();
+    setIsLoading(false);
+    setIsStreaming(false);
+    setError(null);
+    setCanRetry(false);
+  };
+
+  const handleRetry = () => {
+    if (!retryMessagesRef.current || isLoading) return;
+
+    setMessages((prev) => {
+      const last = prev[prev.length - 1];
+      if (last?.role === "assistant") {
+        return prev.slice(0, -1);
+      }
+      return prev;
+    });
+    executeChatRequest(retryMessagesRef.current);
+  };
+
+  const handleRegenerate = () => {
+    if (isLoading || messages.length === 0) return;
+
+    let lastAssistantIndex = -1;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === "assistant") {
+        lastAssistantIndex = i;
+        break;
+      }
+    }
+    if (lastAssistantIndex === -1) return;
+
+    const chatMessages = messages.slice(0, lastAssistantIndex);
+    const last = chatMessages[chatMessages.length - 1];
+    if (!last || last.role !== "user") return;
+
+    setMessages(chatMessages);
+    executeChatRequest(chatMessages);
   };
 
   const handleSubmit = (e: React.FormEvent) => {
@@ -492,12 +667,22 @@ export default function Chat({
   };
 
   const handleClear = () => {
+    if (isLoading) stopGeneration();
     setMessages([]);
     setError(null);
+    setCanRetry(false);
     setActiveProvider(null);
+    retryMessagesRef.current = null;
     clearStoredChat();
     inputRef.current?.focus();
   };
+
+  const lastAssistantIndex = (() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === "assistant") return i;
+    }
+    return -1;
+  })();
 
   // Avoid hydration mismatch: wait until localStorage is read before rendering chat.
   if (!hydrated) {
@@ -543,13 +728,16 @@ export default function Chat({
             />
           )}
           {messages.length > 0 && (
-            <button
-              type="button"
-              onClick={handleClear}
-              className="rounded-[var(--radius-sm)] px-3 py-1.5 text-sm text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-surface-elevated)] hover:text-[var(--color-text)]"
-            >
-              Clear chat
-            </button>
+            <>
+              <ExportMenu messages={messages} disabled={isLoading} />
+              <button
+                type="button"
+                onClick={handleClear}
+                className="rounded-[var(--radius-sm)] px-3 py-1.5 text-sm text-[var(--color-text-muted)] transition-colors hover:bg-[var(--color-surface-elevated)] hover:text-[var(--color-text)]"
+              >
+                Clear chat
+              </button>
+            </>
           )}
         </div>
       </header>
@@ -573,6 +761,11 @@ export default function Chat({
                     i === messages.length - 1 &&
                     msg.role === "assistant"
                   }
+                  showRegenerate={
+                    i === lastAssistantIndex && msg.role === "assistant"
+                  }
+                  onRegenerate={handleRegenerate}
+                  actionsDisabled={isLoading}
                 />
               ))}
               {showTypingIndicator && <TypingIndicator />}
@@ -584,9 +777,19 @@ export default function Chat({
         {error && (
           <div
             role="alert"
-            className="mx-4 mb-2 rounded-[var(--radius-md)] border border-[var(--color-error)]/30 bg-[var(--color-error)]/10 px-4 py-3 text-sm text-[var(--color-error)] sm:mx-6"
+            className="mx-4 mb-2 flex flex-wrap items-center justify-between gap-3 rounded-[var(--radius-md)] border border-[var(--color-error)]/30 bg-[var(--color-error)]/10 px-4 py-3 text-sm text-[var(--color-error)] sm:mx-6"
           >
-            {error}
+            <span>{error}</span>
+            {canRetry && (
+              <button
+                type="button"
+                onClick={handleRetry}
+                disabled={isLoading}
+                className="shrink-0 rounded-[var(--radius-sm)] border border-[var(--color-error)]/40 px-3 py-1 text-xs font-medium text-[var(--color-error)] transition-colors hover:bg-[var(--color-error)]/10 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                Try again
+              </button>
+            )}
           </div>
         )}
 
@@ -606,31 +809,52 @@ export default function Chat({
               aria-label="Message input"
               className="max-h-32 min-h-[44px] flex-1 resize-none rounded-[var(--radius-md)] border border-[var(--color-border)] bg-[var(--color-surface-elevated)] px-4 py-3 text-[15px] text-[var(--color-text)] placeholder:text-[var(--color-text-muted)] transition-colors focus:border-[var(--color-primary)] disabled:opacity-50"
             />
-            <button
-              type="submit"
-              disabled={isLoading || !input.trim()}
-              aria-label="Send message"
-              className="flex h-11 w-11 shrink-0 items-center justify-center rounded-[var(--radius-md)] bg-[var(--color-primary)] text-white transition-colors hover:bg-[var(--color-primary-hover)] disabled:cursor-not-allowed disabled:opacity-40"
-            >
-              <svg
-                width="20"
-                height="20"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                aria-hidden="true"
+            {isLoading ? (
+              <button
+                type="button"
+                onClick={stopGeneration}
+                aria-label="Stop generation"
+                className="flex h-11 w-11 shrink-0 items-center justify-center rounded-[var(--radius-md)] border border-[var(--color-border)] bg-[var(--color-surface-elevated)] text-[var(--color-text)] transition-colors hover:bg-[var(--color-surface)]"
               >
-                <path
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"
-                />
-              </svg>
-            </button>
+                <svg
+                  width="18"
+                  height="18"
+                  viewBox="0 0 24 24"
+                  fill="currentColor"
+                  aria-hidden="true"
+                >
+                  <rect x="6" y="6" width="12" height="12" rx="1" />
+                </svg>
+              </button>
+            ) : (
+              <button
+                type="submit"
+                disabled={!input.trim()}
+                aria-label="Send message"
+                className="flex h-11 w-11 shrink-0 items-center justify-center rounded-[var(--radius-md)] bg-[var(--color-primary)] text-white transition-colors hover:bg-[var(--color-primary-hover)] disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <svg
+                  width="20"
+                  height="20"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  aria-hidden="true"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"
+                  />
+                </svg>
+              </button>
+            )}
           </div>
           <p className="mx-auto mt-2 max-w-3xl text-center text-xs text-[var(--color-text-muted)]">
-            Press Enter to send, Shift+Enter for new line
+            {isLoading
+              ? "Click stop to cancel generation"
+              : "Press Enter to send, Shift+Enter for new line"}
           </p>
         </form>
       </main>
