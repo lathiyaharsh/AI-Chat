@@ -1,4 +1,8 @@
-import { AI_PROVIDERS, type AIProvider, type ChatMessage } from "@/lib/ai/types";
+import {
+  AI_PROVIDERS,
+  type AIProvider,
+  type ChatMessage,
+} from "@/lib/ai/types";
 
 export const MAX_MESSAGES = 50;
 export const MAX_MESSAGE_LENGTH = 8000;
@@ -67,14 +71,18 @@ export function validateMessages(messages: unknown): string | null {
   return null;
 }
 
-function parseRequestedProvider(
-  value: unknown
-): { provider?: AIProvider; error?: string } {
+function parseRequestedProvider(value: unknown): {
+  provider?: AIProvider;
+  error?: string;
+} {
   if (value === undefined || value === null) {
     return {};
   }
 
-  if (typeof value !== "string" || !AI_PROVIDERS.includes(value as AIProvider)) {
+  if (
+    typeof value !== "string" ||
+    !AI_PROVIDERS.includes(value as AIProvider)
+  ) {
     return { error: "Invalid AI provider" };
   }
 

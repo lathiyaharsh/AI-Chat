@@ -211,7 +211,11 @@ async function startGroqStream(
   }
 
   if (!response.body) {
-    throw new ProviderError("groq", undefined, "Groq returned an empty stream.");
+    throw new ProviderError(
+      "groq",
+      undefined,
+      "Groq returned an empty stream."
+    );
   }
 
   return { format: "openai", body: response.body };
@@ -255,7 +259,11 @@ async function startGeminiStream(
   }
 
   if (!response.body) {
-    throw new ProviderError("gemini", undefined, "Gemini returned an empty stream.");
+    throw new ProviderError(
+      "gemini",
+      undefined,
+      "Gemini returned an empty stream."
+    );
   }
 
   return { format: "gemini", body: response.body };
@@ -461,7 +469,11 @@ async function callGroq(
   const content = data.choices?.[0]?.message?.content;
 
   if (!content) {
-    throw new ProviderError("groq", undefined, "Groq returned an empty response.");
+    throw new ProviderError(
+      "groq",
+      undefined,
+      "Groq returned an empty response."
+    );
   }
 
   return content;

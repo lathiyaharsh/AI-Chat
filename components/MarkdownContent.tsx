@@ -43,7 +43,10 @@ const markdownComponents: Components = {
 export default function MarkdownContent({ content }: { content: string }) {
   return (
     <div className="chat-markdown">
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={markdownComponents}
+      >
         {content}
       </ReactMarkdown>
     </div>

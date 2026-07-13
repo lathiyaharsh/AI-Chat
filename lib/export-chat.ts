@@ -26,7 +26,9 @@ export function downloadChat(
   format: "txt" | "md"
 ): void {
   const content =
-    format === "md" ? formatChatAsMarkdown(messages) : formatChatAsText(messages);
+    format === "md"
+      ? formatChatAsMarkdown(messages)
+      : formatChatAsText(messages);
   const mimeType = format === "md" ? "text/markdown" : "text/plain";
 
   const blob = new Blob([content], { type: `${mimeType};charset=utf-8` });

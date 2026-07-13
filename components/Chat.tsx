@@ -436,7 +436,14 @@ export default function Chat({
       conciseMode,
       activeProvider,
     });
-  }, [messages, selectedProvider, conciseMode, activeProvider, hydrated, isStreaming]);
+  }, [
+    messages,
+    selectedProvider,
+    conciseMode,
+    activeProvider,
+    hydrated,
+    isStreaming,
+  ]);
 
   // Keep the latest message visible while chatting.
   useEffect(() => {
@@ -695,7 +702,9 @@ export default function Chat({
 
   // Show dots only before streaming starts (not while tokens are flowing).
   const showTypingIndicator =
-    isLoading && !isStreaming && messages[messages.length - 1]?.role !== "assistant";
+    isLoading &&
+    !isStreaming &&
+    messages[messages.length - 1]?.role !== "assistant";
 
   return (
     <div className="flex h-dvh flex-col bg-[var(--color-bg)]">

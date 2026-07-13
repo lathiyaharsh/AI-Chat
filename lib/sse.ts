@@ -11,10 +11,7 @@ export const SSE_HEADERS: Record<string, string> = {
 };
 
 /** Build an HTTP response that streams one or more SSE events. */
-export function createSseResponse(
-  events: object[],
-  status = 200
-): Response {
+export function createSseResponse(events: object[], status = 200): Response {
   const encoder = new TextEncoder();
 
   const stream = new ReadableStream({
@@ -30,9 +27,6 @@ export function createSseResponse(
 }
 
 /** Build an SSE response containing a single error event. */
-export function createSseErrorResponse(
-  error: string,
-  status = 500
-): Response {
+export function createSseErrorResponse(error: string, status = 500): Response {
   return createSseResponse([{ type: "error", error }], status);
 }

@@ -38,9 +38,9 @@ describe("validateMessages", () => {
   });
 
   it("requires alternating roles ending with a user message", () => {
-    expect(
-      validateMessages([{ role: "assistant", content: "Hi" }])
-    ).toBe("Invalid message order at index 0");
+    expect(validateMessages([{ role: "assistant", content: "Hi" }])).toBe(
+      "Invalid message order at index 0"
+    );
 
     expect(
       validateMessages([
@@ -51,16 +51,16 @@ describe("validateMessages", () => {
   });
 
   it("rejects empty last user message", () => {
-    expect(
-      validateMessages([{ role: "user", content: "   " }])
-    ).toBe("Last message must be a non-empty user message");
+    expect(validateMessages([{ role: "user", content: "   " }])).toBe(
+      "Last message must be a non-empty user message"
+    );
   });
 
   it("rejects messages that are too long", () => {
     const longContent = "a".repeat(MAX_MESSAGE_LENGTH + 1);
-    expect(
-      validateMessages([{ role: "user", content: longContent }])
-    ).toBe("Invalid message at index 0");
+    expect(validateMessages([{ role: "user", content: longContent }])).toBe(
+      "Invalid message at index 0"
+    );
   });
 
   it("rejects too many messages", () => {

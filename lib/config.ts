@@ -36,9 +36,7 @@ export function getDefaultProvider(): AIProvider {
 /** Read model name from env, e.g. GROQ_MODEL, GEMINI_MODEL, HUGGINGFACE_MODEL. */
 export function getProviderModel(provider: AIProvider): string {
   const envKey = `${provider.toUpperCase()}_MODEL` as
-    | "GROQ_MODEL"
-    | "GEMINI_MODEL"
-    | "HUGGINGFACE_MODEL";
+    "GROQ_MODEL" | "GEMINI_MODEL" | "HUGGINGFACE_MODEL";
 
   const fromEnv = process.env[envKey]?.replace(/['"]/g, "").trim();
   return fromEnv || DEFAULT_MODELS[provider];

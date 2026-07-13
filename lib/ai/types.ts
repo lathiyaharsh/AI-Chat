@@ -13,7 +13,11 @@ export type ChatMessage = {
 export type AIProvider = "groq" | "gemini" | "huggingface";
 
 /** Provider order also affects fallback order after the primary provider. */
-export const AI_PROVIDERS: AIProvider[] = ["groq", "huggingface", "gemini"] as const;
+export const AI_PROVIDERS: AIProvider[] = [
+  "groq",
+  "huggingface",
+  "gemini",
+] as const;
 
 /** Successful non-streaming API response shape. */
 export type ChatResponse = {
