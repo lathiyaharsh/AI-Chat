@@ -34,13 +34,21 @@ The app can either:
 - Empty state with clickable suggestion chips.
 - Clear chat button (also clears localStorage).
 - **Copy button** on completed assistant messages.
+- **Regenerate** last assistant reply.
+- **Stop generation** button — cancels in-flight streams (client + server).
+- **Try again** button on failed requests.
+- **Export chat** as Markdown (.md) or plain text (.txt).
+- **Syntax highlighting** for code blocks in assistant markdown.
 - Provider dropdown controlled by a feature flag.
 - Markdown rendering for assistant responses (after streaming completes).
 - Server-side API route for AI calls.
 - Provider fallback support (works in both streaming and non-streaming modes).
 - Environment-controlled provider models.
 - Friendly error messages instead of raw provider JSON errors.
+- **Rate limiting** on `/api/chat` (30 requests/minute per IP).
+- **Request validation** with message count/length limits.
 - Secrets stored in `.env.local`.
+- **Prettier** code formatting and **Vitest** unit tests.
 
 ## Technology Stack
 
@@ -51,7 +59,9 @@ The app can either:
 | Language | TypeScript |
 | UI | React |
 | Styling | Tailwind CSS v4 + CSS variables |
-| Markdown | `react-markdown` + `remark-gfm` |
+| Markdown | `react-markdown` + `remark-gfm` + `react-syntax-highlighter` |
+| Testing | Vitest |
+| Formatting | Prettier + ESLint |
 | Backend | Next.js Route Handlers |
 | AI Providers | Groq, Gemini, Hugging Face |
 
@@ -64,6 +74,9 @@ npm run dev
 npm run build
 npm run start
 npm run lint
+npm run format
+npm run format:check
+npm run test
 ```
 
 | Script | Purpose |
@@ -72,6 +85,9 @@ npm run lint
 | `npm run build` | Builds the production app. |
 | `npm run start` | Starts the production server after build. |
 | `npm run lint` | Runs Next.js linting. |
+| `npm run format` | Formats all files with Prettier. |
+| `npm run format:check` | Checks formatting without writing (CI-friendly). |
+| `npm run test` | Runs Vitest unit tests. |
 
 ## Important Dependencies
 
@@ -82,8 +98,12 @@ npm run lint
 | `react-dom` | React DOM rendering. |
 | `react-markdown` | Renders assistant markdown responses. |
 | `remark-gfm` | Enables GitHub Flavored Markdown features like tables and task lists. |
+| `react-syntax-highlighter` | Syntax highlighting for fenced code blocks. |
 | `tailwindcss` | Utility styling framework. |
 | `typescript` | Static typing. |
+| `vitest` | Unit test runner (dev). |
+| `prettier` | Code formatter (dev). |
+| `eslint-config-prettier` | Disables ESLint rules that conflict with Prettier. |
 
 ## Directory Structure
 
@@ -99,19 +119,32 @@ Important source files:
 │   ├── layout.tsx
 │   └── page.tsx
 ├── components/
-│   └── Chat.tsx
+│   ├── Chat.tsx
+│   └── MarkdownContent.tsx
 ├── lib/
 │   ├── ai/
 │   │   ├── providers.ts
 │   │   ├── prompts.ts
 │   │   └── types.ts
+│   ├── api/
+│   │   ├── chat-validation.ts
+│   │   ├── chat-validation.test.ts
+│   │   ├── rate-limit.ts
+│   │   └── rate-limit.test.ts
 │   ├── chat-storage.ts
 │   ├── config.ts
+│   ├── export-chat.ts
+│   ├── sse.ts
+│   ├── sse.test.ts
 │   └── sse-client.ts
 ├── public/
 │   └── assistant-avatar.svg
 ├── .env.example
 ├── .env.local
+├── .prettierrc.json
+├── .prettierignore
+├── eslint.config.mjs
+├── vitest.config.ts
 ├── package.json
 ├── README.md
 └── PROJECT_DOCUMENTATION.md
@@ -243,14 +276,15 @@ High-level request flow (streaming — default):
 ```text
 User types message or clicks a suggestion
   -> Chat.tsx appends user message locally
-  -> Chat.tsx sends POST /api/chat with stream: true
-  -> route.ts validates request
+  -> Chat.tsx sends POST /api/chat with stream: true and AbortSignal
+  -> route.ts rate-limits, then validates via lib/api/chat-validation.ts
   -> createChatStream() picks provider order and tries each provider
-  -> Provider API streams tokens back
-  -> Server re-wraps tokens as SSE events (meta, chunk, done, error)
+  -> Provider API streams tokens back (cancellable via request.signal)
+  -> Server re-wraps tokens as SSE events via lib/sse.ts (meta, chunk, done, error)
   -> lib/sse-client.ts parses SSE on the browser
   -> Chat.tsx appends chunks to the assistant bubble in real time
-  -> After done, markdown is rendered and chat is saved to localStorage
+  -> After done, MarkdownContent renders markdown + syntax highlighting
+  -> Chat history saved to localStorage
 ```
 
 Non-streaming fallback (`stream: false`):
@@ -278,13 +312,16 @@ This file contains the complete chat UI.
 | `AssistantAvatar` | Renders the assistant bot image from `public/assistant-avatar.svg`. |
 | `TypingIndicator` | Shows animated dots while waiting for the first stream chunk. |
 | `CopyButton` | Copies assistant message text to the clipboard. |
+| `MessageActionButton` | Reusable action button (used for Regenerate). |
 | `MessageContent` | Renders user text, plain text while streaming, or markdown when complete. |
 | `MessageBubble` | Renders a single user or assistant message bubble. |
 | `EmptyState` | Shows initial empty chat screen and suggestion chips. |
 | `SuggestionChip` | Clickable suggestion that calls `sendMessage()` directly. |
+| `ExportMenu` | Header dropdown to download chat as `.md` or `.txt`. |
 | `ProviderSelect` | Dropdown for manual provider selection. |
 | `ReplyModeToggle` | Concise / Detailed toggle sent to the API as `concise: true/false`. |
 | `Chat` | Main chat component with state, streaming, and localStorage. |
+| `MarkdownContent` | Renders completed assistant markdown with syntax highlighting. |
 
 ### Frontend State
 
@@ -301,6 +338,7 @@ The chat component keeps these values in React state:
 | `selectedProvider` | Provider selected by the user when the flag is enabled. |
 | `conciseMode` | Whether concise reply style is enabled. |
 | `hydrated` | Whether localStorage has been loaded (avoids hydration mismatch). |
+| `canRetry` | Whether the error banner should show a **Try again** button. |
 
 ### localStorage Persistence
 
@@ -323,20 +361,28 @@ Behavior:
 
 ### Sending A Message
 
-The `sendMessage()` function:
+The `sendMessage()` function appends a user message and calls `executeChatRequest()`.
 
-1. trims the input,
-2. ignores empty messages,
-3. appends the user message locally,
-4. clears the input,
-5. sets loading state,
-6. sends a `POST /api/chat` request with `stream: true`,
-7. creates an empty assistant message bubble,
-8. reads SSE events via `readChatStream()`,
-9. on `meta` / `done` — updates the active provider label,
-10. on `chunk` — appends text (batched with `requestAnimationFrame` for smooth UI),
-11. on `error` — shows a friendly error and removes empty assistant bubble,
-12. after streaming — renders markdown and saves to localStorage.
+`executeChatRequest()` is the shared core used by send, retry, and regenerate:
+
+1. creates an `AbortController` and passes `signal` to `fetch`,
+2. sends `POST /api/chat` with `stream: true`,
+3. creates an empty assistant message bubble,
+4. reads SSE events via `readChatStream(response, signal)`,
+5. on `meta` / `done` — updates the active provider label,
+6. on `chunk` — appends text (batched with `requestAnimationFrame`),
+7. on `error` — shows a friendly error and enables **Try again**,
+8. after streaming — renders markdown (with syntax highlighting) and saves to localStorage.
+
+### Stop, Retry, and Regenerate
+
+| Action | Function | Behavior |
+| --- | --- | --- |
+| **Stop** | `stopGeneration()` | Aborts `fetch` via `AbortController`; server cancels provider streams via `request.signal`. Keeps partial response. |
+| **Try again** | `handleRetry()` | Resends the last failed message history without adding a new user message. |
+| **Regenerate** | `handleRegenerate()` | Removes the last assistant reply and resends the last user message. |
+
+The send button becomes a **stop** (square) button while `isLoading` is true.
 
 ### API Call From Frontend
 
@@ -346,6 +392,7 @@ The frontend sends:
 fetch("/api/chat", {
   method: "POST",
   headers: { "Content-Type": "application/json" },
+  signal: controller.signal,
   body: JSON.stringify({
     messages: updatedMessages,
     stream: true,
@@ -357,12 +404,23 @@ fetch("/api/chat", {
 
 The `provider` field is only sent when provider switching is enabled.
 
+### Export Chat
+
+`lib/export-chat.ts` formats and downloads chat history:
+
+| Format | Function |
+| --- | --- |
+| Plain text | `formatChatAsText()` → `chat-export-YYYY-MM-DD.txt` |
+| Markdown | `formatChatAsMarkdown()` → `chat-export-YYYY-MM-DD.md` |
+
+Triggered from the **Export** dropdown in the header.
+
 ## Markdown Rendering
 
 Assistant messages are rendered with:
 
-- `react-markdown`
-- `remark-gfm`
+- `react-markdown` + `remark-gfm` (in `components/MarkdownContent.tsx`)
+- `react-syntax-highlighter` (One Dark theme) for fenced code blocks
 
 This means assistant responses can format:
 
@@ -374,12 +432,12 @@ This means assistant responses can format:
 - links,
 - blockquotes,
 - inline code,
-- code blocks,
+- **syntax-highlighted code blocks**,
 - tables.
 
 User messages are rendered as plain text.
 
-During streaming, assistant messages are rendered as **plain text** (no markdown re-parsing on every token). After streaming completes, `react-markdown` renders the final message.
+During streaming, assistant messages are rendered as **plain text** (no markdown re-parsing on every token). After streaming completes, `MarkdownContent` renders the final message with highlighting.
 
 Markdown styles are defined in:
 
@@ -459,6 +517,17 @@ POST /api/chat
 
 Because this is a Next.js App Router route handler, there is no separate Express server.
 
+The route is intentionally thin. It delegates to:
+
+| Module | Responsibility |
+| --- | --- |
+| `lib/api/chat-validation.ts` | Parse and validate request body |
+| `lib/api/rate-limit.ts` | Per-IP rate limiting (30 req/min) |
+| `lib/sse.ts` | Shared SSE encoding and error responses |
+| `lib/ai/providers.ts` | AI provider calls and streaming |
+
+`export const runtime = "nodejs"` ensures provider streaming runs in the Node.js runtime.
+
 ## API Request Body
 
 ```json
@@ -532,18 +601,28 @@ Error response:
 
 ## API Validation
 
-The API route validates:
+Validation lives in `lib/api/chat-validation.ts` (not inline in the route).
 
-- `messages` must be an array.
-- `messages` must not be empty.
-- last message must be a user message.
-- last user message must not be empty.
-- requested provider must be valid.
-- requested provider is accepted only when provider switching is enabled.
+Rules:
 
-`stream` and `concise` are optional booleans. Invalid values are treated as defaults (`stream: true`, `concise: false`).
+| Rule | Detail |
+| --- | --- |
+| Body shape | Must be a JSON object. |
+| `messages` | Required array, max **50** messages. |
+| Each message | Must have `role` (`user` \| `assistant`) and `content` string, max **8000** chars. |
+| Message order | Must alternate `user` → `assistant` → `user` → … |
+| Last message | Must be a non-empty `user` message. |
+| `provider` | Must be a valid provider if provided. |
+| Provider switch | Rejected with 403 when `ALLOW_AI_PROVIDER_SWITCH=false`. |
+| `stream` | Defaults to `true`; `false` or `"false"` disables streaming. |
+| `concise` | Only `true` or `"true"` enables concise mode. |
 
-Validation errors on streaming requests return SSE `error` events. Non-streaming requests return JSON `{ error }`.
+Validation and server errors respect the client's `stream` flag:
+
+- `stream: true` → SSE `{ type: "error", error: "..." }`
+- `stream: false` → JSON `{ error: "..." }`
+
+Rate limit exceeded returns **429** with the same format rules.
 
 ## Shared Types
 
@@ -603,18 +682,28 @@ How each provider receives the prompt:
 
 ## Streaming Architecture
 
+### Shared SSE utilities (`lib/sse.ts`)
+
+| Function | Purpose |
+| --- | --- |
+| `encodeSSE()` | Format one `data: {...}\n\n` line |
+| `createSseResponse()` | Build a streaming HTTP response |
+| `createSseErrorResponse()` | Build an SSE error response |
+| `SSE_HEADERS` | Standard headers including `X-Accel-Buffering: no` |
+
 ### Server side (`lib/ai/providers.ts`)
 
-`createChatStream()` returns a `ReadableStream` that:
+`createChatStream(messages, provider, concise, signal?)` returns a `ReadableStream` that:
 
 1. Builds provider order via `getProviderOrder()`.
-2. Tries each provider with `startProviderStream()`.
+2. Tries each provider with `startProviderStream()` (passes `signal` to `fetch`).
 3. On success, emits SSE events to the browser:
    - `meta` — provider connected
    - `chunk` — text token(s)
    - `done` — stream complete
 4. On failure, tries the next provider.
 5. If all fail, emits a single `error` event.
+6. If `signal` is aborted (user clicked **Stop**), closes the stream immediately without an error event.
 
 Provider-specific stream parsers:
 
@@ -626,7 +715,7 @@ Provider-specific stream parsers:
 
 ### Client side (`lib/sse-client.ts`)
 
-`readChatStream(response)` reads the fetch `Response.body` and yields parsed `ChatStreamEvent` objects:
+`readChatStream(response, signal?)` reads the fetch `Response.body` and yields parsed `ChatStreamEvent` objects. Supports abort via `AbortSignal`.
 
 ```ts
 type ChatStreamEvent =
@@ -636,7 +725,7 @@ type ChatStreamEvent =
   | { type: "error"; error: string };
 ```
 
-`Chat.tsx` consumes these events in a `for await` loop inside `sendMessage()`.
+`Chat.tsx` consumes these events in a `for await` loop inside `executeChatRequest()`.
 
 ## Provider Implementation
 
@@ -1066,6 +1155,36 @@ The concise/detailed toggle still appends its style instructions on top of this 
 - `.env.local` should stay ignored by git.
 - `.env.example` should use placeholder values only.
 - The frontend calls `/api/chat`, not provider APIs directly.
+- **Rate limiting**: 30 requests per minute per IP (in-memory; resets on server restart).
+- **Input limits**: max 50 messages, 8000 chars per message.
+- **Generic 500 errors**: internal details are logged server-side only, not returned to the client.
+
+## Code Quality
+
+### Prettier
+
+Config: `.prettierrc.json`
+
+```bash
+npm run format        # auto-format all files
+npm run format:check  # verify formatting (CI)
+```
+
+ESLint uses `eslint-config-prettier` to avoid rule conflicts.
+
+### Tests
+
+Vitest config: `vitest.config.ts`
+
+```bash
+npm test
+```
+
+| Test file | Covers |
+| --- | --- |
+| `lib/api/chat-validation.test.ts` | Message validation, provider parsing, stream flags |
+| `lib/api/rate-limit.test.ts` | Per-IP rate limiting |
+| `lib/sse.test.ts` | SSE encoding and error responses |
 
 ## Common Troubleshooting
 
@@ -1136,15 +1255,21 @@ Chat is stored in `localStorage` under key `ai-chat-storage`. If history is miss
 - check if **Clear chat** was clicked,
 - check DevTools → Application → Local Storage.
 
+### API returns 429 Too Many Requests
+
+The chat API is rate-limited to **30 requests per minute per IP**. Wait a minute and try again, or restart the dev server to reset in-memory counters during local development.
+
 ## Build Verification
 
 Run:
 
 ```bash
+npm test
+npm run format:check
 npm run build
 ```
 
-This verifies TypeScript types and Next.js compilation across all updated files.
+This verifies unit tests, formatting, TypeScript types, and Next.js compilation.
 
 ## Known Notes
 
@@ -1154,6 +1279,8 @@ This verifies TypeScript types and Next.js compilation across all updated files.
 - Non-streaming JSON mode is available via `stream: false`.
 - The API expects the client to send the full message history.
 - Provider fallback works in both streaming and non-streaming modes.
+- Stop generation cancels both client fetch and server provider streams.
+- Rate limiting is in-memory (not suitable for multi-instance production without Redis).
 - The app is meant as a simple demo foundation.
 
 ## Possible Future Improvements
@@ -1161,12 +1288,10 @@ This verifies TypeScript types and Next.js compilation across all updated files.
 - Add database-backed chat history (replace or supplement localStorage).
 - Add user accounts and authentication.
 - Add chat sessions sidebar (multiple conversations).
-- Add token limits and message trimming.
+- Add token limits and message trimming before sending to providers.
 - Add per-provider model dropdown in the UI.
-- Add retry button on failed messages.
-- Add syntax highlighting for code blocks in markdown.
-- Add rate limiting on `/api/chat`.
-- Add tests for provider fallback and streaming behavior.
+- Add distributed rate limiting (Redis/Upstash) for production.
+- Add integration tests for provider fallback and streaming behavior.
 - Add deployment configuration for Vercel or another host.
 
 ## Quick Reference
@@ -1174,17 +1299,24 @@ This verifies TypeScript types and Next.js compilation across all updated files.
 | Task | File |
 | --- | --- |
 | Change UI | `components/Chat.tsx` |
-| Change API validation | `app/api/chat/route.ts` |
+| Change markdown / syntax highlighting | `components/MarkdownContent.tsx` |
+| Change API route | `app/api/chat/route.ts` |
+| Change request validation | `lib/api/chat-validation.ts` |
+| Change rate limiting | `lib/api/rate-limit.ts` |
+| Change SSE utilities | `lib/sse.ts` |
 | Change provider / streaming logic | `lib/ai/providers.ts` |
 | Change system prompt | `lib/ai/prompts.ts` or `SYSTEM_PROMPT` in `.env.local` |
 | Change SSE client parser | `lib/sse-client.ts` |
 | Change localStorage behavior | `lib/chat-storage.ts` |
+| Change export format | `lib/export-chat.ts` |
 | Change env parsing | `lib/config.ts` |
 | Change shared types | `lib/ai/types.ts` |
 | Change theme | `app/globals.css` |
 | Change avatar | `public/assistant-avatar.svg` |
 | Change models | `.env.local` |
 | Change provider flag | `.env.local` |
+| Run tests | `npm test` |
+| Format code | `npm run format` |
 
 ## End-To-End Example (Streaming)
 
