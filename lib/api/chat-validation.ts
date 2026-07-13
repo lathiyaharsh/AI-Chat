@@ -4,7 +4,7 @@ import {
   type ChatMessage,
 } from "@/lib/ai/types";
 
-export const MAX_MESSAGES = 50;
+export const MAX_MESSAGES = 100;
 export const MAX_MESSAGE_LENGTH = 8000;
 
 export type ValidatedChatRequest = {
