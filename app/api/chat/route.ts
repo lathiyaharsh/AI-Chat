@@ -11,106 +11,72 @@
  * - concise vs detailed reply mode
  */
 import { NextRequest } from "next/server";
+import {
+  parseStreamFlag,
+  validateChatRequest,
+} from "@/lib/api/chat-validation";
+import { checkRateLimit, getClientIp } from "@/lib/api/rate-limit";
 import { createChatStream, generateChatResponse } from "@/lib/ai/providers";
-import { AI_PROVIDERS, type AIProvider, type ChatMessage } from "@/lib/ai/types";
 import { isProviderSwitchAllowed } from "@/lib/config";
+import { createSseErrorResponse, SSE_HEADERS } from "@/lib/sse";
 
-/** Validate incoming request before calling any AI provider. */
-function validateRequest(
-  messages: ChatMessage[],
-  requestedProvider?: AIProvider
-): string | null {
-  if (!Array.isArray(messages) || messages.length === 0) {
-    return "Messages array is required";
+export const runtime = "nodejs";
+
+const GENERIC_ERROR = "Failed to generate response";
+const RATE_LIMIT_ERROR = "Too many requests. Please try again later.";
+
+function errorResponse(
+  error: string,
+  status: number,
+  stream: boolean
+): Response {
+  if (stream) {
+    return createSseErrorResponse(error, status);
   }
 
-  const lastMessage = messages[messages.length - 1];
-  if (lastMessage.role !== "user" || !lastMessage.content?.trim()) {
-    return "Last message must be a non-empty user message";
-  }
+  return Response.json({ error }, { status });
+}
 
-  if (requestedProvider) {
-    if (!isProviderSwitchAllowed()) {
-      return "AI provider switching is disabled";
-    }
-
-    if (!AI_PROVIDERS.includes(requestedProvider)) {
-      return "Invalid AI provider";
-    }
-  }
-
-  return null;
+function getStreamFlagFromBody(body: unknown): boolean {
+  if (typeof body !== "object" || body === null) return true;
+  return parseStreamFlag((body as Record<string, unknown>).stream);
 }
 
 export async function POST(request: NextRequest) {
+  let stream = true;
+
   try {
     const body = await request.json();
-    const messages: ChatMessage[] = body.messages;
-    const requestedProvider = body.provider as AIProvider | undefined;
-    const concise = body.concise === true; // UI toggle: short vs detailed answers
-    const stream = body.stream !== false; // streaming is enabled by default
+    stream = getStreamFlagFromBody(body);
 
-    const validationError = validateRequest(messages, requestedProvider);
-    if (validationError) {
-      const status =
-        validationError === "AI provider switching is disabled" ? 403 : 400;
-
-      // Return validation errors in the same format the client expects.
-      if (stream) {
-        const encoder = new TextEncoder();
-        const errorStream = new ReadableStream({
-          start(controller) {
-            controller.enqueue(
-              encoder.encode(
-                `data: ${JSON.stringify({ type: "error", error: validationError })}\n\n`
-              )
-            );
-            controller.close();
-          },
-        });
-
-        return new Response(errorStream, {
-          status,
-          headers: {
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache",
-            Connection: "keep-alive",
-          },
-        });
-      }
-
-      return Response.json({ error: validationError }, { status });
+    const clientIp = getClientIp(request.headers);
+    if (!checkRateLimit(clientIp)) {
+      return errorResponse(RATE_LIMIT_ERROR, 429, stream);
     }
 
-    // Main path: stream tokens back to the browser as Server-Sent Events (SSE).
-    if (stream) {
+    const validation = validateChatRequest(body, isProviderSwitchAllowed());
+    if (!validation.ok) {
+      return errorResponse(validation.error, validation.status, stream);
+    }
+
+    const { messages, provider, concise, stream: useStream } = validation.data;
+    stream = useStream;
+
+    if (useStream) {
       const readableStream = createChatStream(
         messages,
-        requestedProvider,
-        concise
+        provider,
+        concise,
+        request.signal
       );
 
-      return new Response(readableStream, {
-        headers: {
-          "Content-Type": "text/event-stream",
-          "Cache-Control": "no-cache",
-          Connection: "keep-alive",
-        },
-      });
+      return new Response(readableStream, { headers: SSE_HEADERS });
     }
 
-    // Fallback path: wait for the full response, then return JSON.
-    const result = await generateChatResponse(
-      messages,
-      requestedProvider,
-      concise
-    );
-
+    const result = await generateChatResponse(messages, provider, concise);
     return Response.json(result);
   } catch (error) {
-    const message =
-      error instanceof Error ? error.message : "Failed to generate response";
-
-    return Response.json({ error: message }, { status: 500 });
+    console.error("Chat API error:", error);
+    return errorResponse(GENERIC_ERROR, 500, stream);
   }
 }

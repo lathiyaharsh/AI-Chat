@@ -10,6 +10,7 @@
 import type { ChatMessage, AIProvider } from "./types";
 import { AI_PROVIDERS, getProviderLabel } from "./types";
 import { getDefaultProvider, getProviderModel } from "@/lib/config";
+import { encodeSSE } from "@/lib/sse";
 import {
   buildSystemPrompt,
   toGeminiContents,
@@ -81,14 +82,9 @@ function getApiKey(provider: AIProvider): string | undefined {
   }
 }
 
-/** Format one SSE event for the browser. */
-function encodeSSE(data: object): string {
-  return `data: ${JSON.stringify(data)}\n\n`;
-}
-
-/** Parse OpenAI-style streaming chunks from Groq / Hugging Face. */
 async function* parseOpenAIStream(
-  stream: ReadableStream<Uint8Array>
+  stream: ReadableStream<Uint8Array>,
+  signal?: AbortSignal
 ): AsyncGenerator<string> {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
@@ -96,6 +92,8 @@ async function* parseOpenAIStream(
 
   try {
     while (true) {
+      if (signal?.aborted) break;
+
       const { done, value } = await reader.read();
       if (done) break;
 
@@ -126,7 +124,8 @@ async function* parseOpenAIStream(
 
 /** Parse Gemini SSE streaming chunks. */
 async function* parseGeminiStream(
-  stream: ReadableStream<Uint8Array>
+  stream: ReadableStream<Uint8Array>,
+  signal?: AbortSignal
 ): AsyncGenerator<string> {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
@@ -134,6 +133,8 @@ async function* parseGeminiStream(
 
   try {
     while (true) {
+      if (signal?.aborted) break;
+
       const { done, value } = await reader.read();
       if (done) break;
 
@@ -163,20 +164,22 @@ async function* parseGeminiStream(
 }
 
 async function* parseProviderStream(
-  providerStream: ProviderStream
+  providerStream: ProviderStream,
+  signal?: AbortSignal
 ): AsyncGenerator<string> {
   if (providerStream.format === "openai") {
-    yield* parseOpenAIStream(providerStream.body);
+    yield* parseOpenAIStream(providerStream.body, signal);
     return;
   }
 
-  yield* parseGeminiStream(providerStream.body);
+  yield* parseGeminiStream(providerStream.body, signal);
 }
 
 async function startGroqStream(
   messages: ChatMessage[],
   apiKey: string,
-  concise: boolean
+  concise: boolean,
+  signal?: AbortSignal
 ): Promise<ProviderStream> {
   const response = await fetch(
     "https://api.groq.com/openai/v1/chat/completions",
@@ -186,6 +189,7 @@ async function startGroqStream(
         Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
       },
+      signal,
       body: JSON.stringify({
         model: getProviderModel("groq"),
         messages: toOpenAIMessages(messages, concise),
@@ -216,7 +220,8 @@ async function startGroqStream(
 async function startGeminiStream(
   messages: ChatMessage[],
   apiKey: string,
-  concise: boolean
+  concise: boolean,
+  signal?: AbortSignal
 ): Promise<ProviderStream> {
   const model = getProviderModel("gemini");
 
@@ -225,6 +230,7 @@ async function startGeminiStream(
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      signal,
       body: JSON.stringify({
         systemInstruction: {
           parts: [{ text: buildSystemPrompt(concise) }],
@@ -258,7 +264,8 @@ async function startGeminiStream(
 async function startHuggingFaceStream(
   messages: ChatMessage[],
   apiKey: string,
-  concise: boolean
+  concise: boolean,
+  signal?: AbortSignal
 ): Promise<ProviderStream> {
   const response = await fetch(
     "https://router.huggingface.co/v1/chat/completions",
@@ -268,6 +275,7 @@ async function startHuggingFaceStream(
         Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
       },
+      signal,
       body: JSON.stringify({
         model: getProviderModel("huggingface"),
         messages: toOpenAIMessages(messages, concise),
@@ -302,7 +310,8 @@ async function startHuggingFaceStream(
 async function startProviderStream(
   provider: AIProvider,
   messages: ChatMessage[],
-  concise: boolean
+  concise: boolean,
+  signal?: AbortSignal
 ): Promise<ProviderStream> {
   const apiKey = getApiKey(provider);
 
@@ -316,11 +325,11 @@ async function startProviderStream(
 
   switch (provider) {
     case "groq":
-      return startGroqStream(messages, apiKey, concise);
+      return startGroqStream(messages, apiKey, concise, signal);
     case "gemini":
-      return startGeminiStream(messages, apiKey, concise);
+      return startGeminiStream(messages, apiKey, concise, signal);
     case "huggingface":
-      return startHuggingFaceStream(messages, apiKey, concise);
+      return startHuggingFaceStream(messages, apiKey, concise, signal);
   }
 }
 
@@ -331,7 +340,8 @@ async function startProviderStream(
 export function createChatStream(
   messages: ChatMessage[],
   selectedProvider?: AIProvider,
-  concise = false
+  concise = false,
+  signal?: AbortSignal
 ): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder();
 
@@ -341,17 +351,42 @@ export function createChatStream(
       const errors: string[] = [];
 
       for (const provider of providersToTry) {
+        if (signal?.aborted) {
+          controller.close();
+          return;
+        }
+
         try {
-          const upstream = await startProviderStream(provider, messages, concise);
+          const upstream = await startProviderStream(
+            provider,
+            messages,
+            concise,
+            signal
+          );
+
+          if (signal?.aborted) {
+            controller.close();
+            return;
+          }
 
           controller.enqueue(
             encoder.encode(encodeSSE({ type: "meta", provider }))
           );
 
-          for await (const chunk of parseProviderStream(upstream)) {
+          for await (const chunk of parseProviderStream(upstream, signal)) {
+            if (signal?.aborted) {
+              controller.close();
+              return;
+            }
+
             controller.enqueue(
               encoder.encode(encodeSSE({ type: "chunk", content: chunk }))
             );
+          }
+
+          if (signal?.aborted) {
+            controller.close();
+            return;
           }
 
           controller.enqueue(
@@ -360,10 +395,20 @@ export function createChatStream(
           controller.close();
           return;
         } catch (error) {
+          if (signal?.aborted) {
+            controller.close();
+            return;
+          }
+
           const msg =
             error instanceof Error ? error.message : "Unknown provider error";
           errors.push(msg);
         }
+      }
+
+      if (signal?.aborted) {
+        controller.close();
+        return;
       }
 
       controller.enqueue(
