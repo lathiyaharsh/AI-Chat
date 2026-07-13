@@ -1,12 +1,31 @@
+/**
+ * AI provider layer.
+ *
+ * Responsibilities:
+ * 1. Call Groq / Gemini / Hugging Face APIs
+ * 2. Convert chat messages into each provider's required format
+ * 3. Stream responses back to the API route as SSE events
+ * 4. Fall back to the next provider if one fails
+ */
 import type { ChatMessage, AIProvider } from "./types";
 import { AI_PROVIDERS, getProviderLabel } from "./types";
 import { getDefaultProvider, getProviderModel } from "@/lib/config";
+import {
+  buildSystemPrompt,
+  toGeminiContents,
+  toOpenAIMessages,
+} from "./prompts";
 
+/** Custom error type so we can show friendly messages in the UI. */
 class ProviderError extends Error {
   provider: AIProvider;
   status?: number;
 
-  constructor(provider: AIProvider, status: number | undefined, message: string) {
+  constructor(
+    provider: AIProvider,
+    status: number | undefined,
+    message: string
+  ) {
     super(message);
     this.name = "ProviderError";
     this.provider = provider;
@@ -14,6 +33,12 @@ class ProviderError extends Error {
   }
 }
 
+type ProviderStream = {
+  format: "openai" | "gemini";
+  body: ReadableStream<Uint8Array>;
+};
+
+/** Convert HTTP status codes into short user-friendly messages. */
 function friendlyMessage(provider: AIProvider, status?: number): string {
   const label = getProviderLabel(provider);
   switch (status) {
@@ -34,12 +59,17 @@ function friendlyMessage(provider: AIProvider, status?: number): string {
   }
 }
 
+/**
+ * Decide which providers to try, and in what order.
+ * Example: selected gemini -> gemini, groq, huggingface
+ */
 function getProviderOrder(selectedProvider?: AIProvider): AIProvider[] {
   const primary = selectedProvider ?? getDefaultProvider();
   const others = AI_PROVIDERS.filter((provider) => provider !== primary);
   return [primary, ...others];
 }
 
+/** Read API keys from server env. Never expose these to the browser. */
 function getApiKey(provider: AIProvider): string | undefined {
   switch (provider) {
     case "groq":
@@ -51,9 +81,309 @@ function getApiKey(provider: AIProvider): string | undefined {
   }
 }
 
+/** Format one SSE event for the browser. */
+function encodeSSE(data: object): string {
+  return `data: ${JSON.stringify(data)}\n\n`;
+}
+
+/** Parse OpenAI-style streaming chunks from Groq / Hugging Face. */
+async function* parseOpenAIStream(
+  stream: ReadableStream<Uint8Array>
+): AsyncGenerator<string> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith("data:")) continue;
+
+        const payload = trimmed.slice(5).trim();
+        if (!payload || payload === "[DONE]") continue;
+
+        try {
+          const json = JSON.parse(payload);
+          const content = json.choices?.[0]?.delta?.content;
+          if (content) yield content;
+        } catch {
+          // Skip malformed chunks.
+        }
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+/** Parse Gemini SSE streaming chunks. */
+async function* parseGeminiStream(
+  stream: ReadableStream<Uint8Array>
+): AsyncGenerator<string> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith("data:")) continue;
+
+        const payload = trimmed.slice(5).trim();
+        if (!payload || payload === "[DONE]") continue;
+
+        try {
+          const json = JSON.parse(payload);
+          const content = json.candidates?.[0]?.content?.parts?.[0]?.text;
+          if (content) yield content;
+        } catch {
+          // Skip malformed chunks.
+        }
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+async function* parseProviderStream(
+  providerStream: ProviderStream
+): AsyncGenerator<string> {
+  if (providerStream.format === "openai") {
+    yield* parseOpenAIStream(providerStream.body);
+    return;
+  }
+
+  yield* parseGeminiStream(providerStream.body);
+}
+
+async function startGroqStream(
+  messages: ChatMessage[],
+  apiKey: string,
+  concise: boolean
+): Promise<ProviderStream> {
+  const response = await fetch(
+    "https://api.groq.com/openai/v1/chat/completions",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: getProviderModel("groq"),
+        messages: toOpenAIMessages(messages, concise),
+        temperature: 0.7,
+        max_tokens: 1024,
+        stream: true,
+      }),
+    }
+  );
+
+  if (!response.ok) {
+    const body = await response.text();
+    console.error(`Groq API error (${response.status}):`, body);
+    throw new ProviderError(
+      "groq",
+      response.status,
+      friendlyMessage("groq", response.status)
+    );
+  }
+
+  if (!response.body) {
+    throw new ProviderError("groq", undefined, "Groq returned an empty stream.");
+  }
+
+  return { format: "openai", body: response.body };
+}
+
+async function startGeminiStream(
+  messages: ChatMessage[],
+  apiKey: string,
+  concise: boolean
+): Promise<ProviderStream> {
+  const model = getProviderModel("gemini");
+
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse&key=${apiKey}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        systemInstruction: {
+          parts: [{ text: buildSystemPrompt(concise) }],
+        },
+        contents: toGeminiContents(messages),
+        generationConfig: {
+          temperature: 0.7,
+          maxOutputTokens: 1024,
+        },
+      }),
+    }
+  );
+
+  if (!response.ok) {
+    const body = await response.text();
+    console.error(`Gemini API error (${response.status}):`, body);
+    throw new ProviderError(
+      "gemini",
+      response.status,
+      friendlyMessage("gemini", response.status)
+    );
+  }
+
+  if (!response.body) {
+    throw new ProviderError("gemini", undefined, "Gemini returned an empty stream.");
+  }
+
+  return { format: "gemini", body: response.body };
+}
+
+async function startHuggingFaceStream(
+  messages: ChatMessage[],
+  apiKey: string,
+  concise: boolean
+): Promise<ProviderStream> {
+  const response = await fetch(
+    "https://router.huggingface.co/v1/chat/completions",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: getProviderModel("huggingface"),
+        messages: toOpenAIMessages(messages, concise),
+        temperature: 0.7,
+        max_tokens: 1024,
+        stream: true,
+      }),
+    }
+  );
+
+  if (!response.ok) {
+    const body = await response.text();
+    console.error(`HuggingFace API error (${response.status}):`, body);
+    throw new ProviderError(
+      "huggingface",
+      response.status,
+      friendlyMessage("huggingface", response.status)
+    );
+  }
+
+  if (!response.body) {
+    throw new ProviderError(
+      "huggingface",
+      undefined,
+      "Hugging Face returned an empty stream."
+    );
+  }
+
+  return { format: "openai", body: response.body };
+}
+
+async function startProviderStream(
+  provider: AIProvider,
+  messages: ChatMessage[],
+  concise: boolean
+): Promise<ProviderStream> {
+  const apiKey = getApiKey(provider);
+
+  if (!apiKey) {
+    throw new ProviderError(
+      provider,
+      undefined,
+      `${getProviderLabel(provider)} API key is not configured.`
+    );
+  }
+
+  switch (provider) {
+    case "groq":
+      return startGroqStream(messages, apiKey, concise);
+    case "gemini":
+      return startGeminiStream(messages, apiKey, concise);
+    case "huggingface":
+      return startHuggingFaceStream(messages, apiKey, concise);
+  }
+}
+
+/**
+ * Main streaming function used by /api/chat.
+ * Tries providers in order and forwards chunks to the browser.
+ */
+export function createChatStream(
+  messages: ChatMessage[],
+  selectedProvider?: AIProvider,
+  concise = false
+): ReadableStream<Uint8Array> {
+  const encoder = new TextEncoder();
+
+  return new ReadableStream({
+    async start(controller) {
+      const providersToTry = getProviderOrder(selectedProvider);
+      const errors: string[] = [];
+
+      for (const provider of providersToTry) {
+        try {
+          const upstream = await startProviderStream(provider, messages, concise);
+
+          controller.enqueue(
+            encoder.encode(encodeSSE({ type: "meta", provider }))
+          );
+
+          for await (const chunk of parseProviderStream(upstream)) {
+            controller.enqueue(
+              encoder.encode(encodeSSE({ type: "chunk", content: chunk }))
+            );
+          }
+
+          controller.enqueue(
+            encoder.encode(encodeSSE({ type: "done", provider }))
+          );
+          controller.close();
+          return;
+        } catch (error) {
+          const msg =
+            error instanceof Error ? error.message : "Unknown provider error";
+          errors.push(msg);
+        }
+      }
+
+      controller.enqueue(
+        encoder.encode(
+          encodeSSE({
+            type: "error",
+            error: `Couldn't get a response. ${errors.join(" ")}`.trim(),
+          })
+        )
+      );
+      controller.close();
+    },
+  });
+}
+
+// Non-streaming fallback for direct API use.
 async function callGroq(
   messages: ChatMessage[],
-  apiKey: string
+  apiKey: string,
+  concise: boolean
 ): Promise<string> {
   const response = await fetch(
     "https://api.groq.com/openai/v1/chat/completions",
@@ -65,7 +395,7 @@ async function callGroq(
       },
       body: JSON.stringify({
         model: getProviderModel("groq"),
-        messages: messages.map((m) => ({ role: m.role, content: m.content })),
+        messages: toOpenAIMessages(messages, concise),
         temperature: 0.7,
         max_tokens: 1024,
       }),
@@ -75,7 +405,11 @@ async function callGroq(
   if (!response.ok) {
     const body = await response.text();
     console.error(`Groq API error (${response.status}):`, body);
-    throw new ProviderError("groq", response.status, friendlyMessage("groq", response.status));
+    throw new ProviderError(
+      "groq",
+      response.status,
+      friendlyMessage("groq", response.status)
+    );
   }
 
   const data = await response.json();
@@ -90,13 +424,9 @@ async function callGroq(
 
 async function callGemini(
   messages: ChatMessage[],
-  apiKey: string
+  apiKey: string,
+  concise: boolean
 ): Promise<string> {
-  const contents = messages.map((m) => ({
-    role: m.role === "assistant" ? "model" : "user",
-    parts: [{ text: m.content }],
-  }));
-
   const model = getProviderModel("gemini");
 
   const response = await fetch(
@@ -105,7 +435,10 @@ async function callGemini(
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        contents,
+        systemInstruction: {
+          parts: [{ text: buildSystemPrompt(concise) }],
+        },
+        contents: toGeminiContents(messages),
         generationConfig: {
           temperature: 0.7,
           maxOutputTokens: 1024,
@@ -117,14 +450,22 @@ async function callGemini(
   if (!response.ok) {
     const body = await response.text();
     console.error(`Gemini API error (${response.status}):`, body);
-    throw new ProviderError("gemini", response.status, friendlyMessage("gemini", response.status));
+    throw new ProviderError(
+      "gemini",
+      response.status,
+      friendlyMessage("gemini", response.status)
+    );
   }
 
   const data = await response.json();
   const content = data.candidates?.[0]?.content?.parts?.[0]?.text;
 
   if (!content) {
-    throw new ProviderError("gemini", undefined, "Gemini returned an empty response.");
+    throw new ProviderError(
+      "gemini",
+      undefined,
+      "Gemini returned an empty response."
+    );
   }
 
   return content;
@@ -132,7 +473,8 @@ async function callGemini(
 
 async function callHuggingFace(
   messages: ChatMessage[],
-  apiKey: string
+  apiKey: string,
+  concise: boolean
 ): Promise<string> {
   const response = await fetch(
     "https://router.huggingface.co/v1/chat/completions",
@@ -144,7 +486,7 @@ async function callHuggingFace(
       },
       body: JSON.stringify({
         model: getProviderModel("huggingface"),
-        messages: messages.map((m) => ({ role: m.role, content: m.content })),
+        messages: toOpenAIMessages(messages, concise),
         temperature: 0.7,
         max_tokens: 1024,
         stream: false,
@@ -178,7 +520,8 @@ async function callHuggingFace(
 
 async function callProvider(
   provider: AIProvider,
-  messages: ChatMessage[]
+  messages: ChatMessage[],
+  concise: boolean
 ): Promise<string> {
   const apiKey = getApiKey(provider);
 
@@ -192,24 +535,29 @@ async function callProvider(
 
   switch (provider) {
     case "groq":
-      return callGroq(messages, apiKey);
+      return callGroq(messages, apiKey, concise);
     case "gemini":
-      return callGemini(messages, apiKey);
+      return callGemini(messages, apiKey, concise);
     case "huggingface":
-      return callHuggingFace(messages, apiKey);
+      return callHuggingFace(messages, apiKey, concise);
   }
 }
 
+/**
+ * Non-streaming fallback.
+ * Useful for testing or when stream: false is sent to the API.
+ */
 export async function generateChatResponse(
   messages: ChatMessage[],
-  selectedProvider?: AIProvider
+  selectedProvider?: AIProvider,
+  concise = false
 ): Promise<{ message: string; provider: AIProvider }> {
   const providersToTry = getProviderOrder(selectedProvider);
   const errors: string[] = [];
 
   for (const provider of providersToTry) {
     try {
-      const message = await callProvider(provider, messages);
+      const message = await callProvider(provider, messages, concise);
       return { message, provider };
     } catch (error) {
       const msg =
@@ -218,7 +566,5 @@ export async function generateChatResponse(
     }
   }
 
-  throw new Error(
-    `Couldn't get a response. ${errors.join(" ")}`.trim()
-  );
+  throw new Error(`Couldn't get a response. ${errors.join(" ")}`.trim());
 }

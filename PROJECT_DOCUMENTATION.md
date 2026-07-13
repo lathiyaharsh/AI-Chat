@@ -25,14 +25,19 @@ The app can either:
 ## Main Features
 
 - Chat UI with message history.
+- **Streaming responses** via Server-Sent Events (SSE) — tokens appear as they are generated.
+- **localStorage persistence** — chat history, provider choice, and reply mode survive page refresh.
+- **Concise / Detailed toggle** — controls how long assistant answers are.
+- **Configurable system prompt** via `SYSTEM_PROMPT` in `.env.local`.
 - Assistant avatar.
-- Typing indicator.
-- Empty state with suggestions.
-- Clear chat button.
+- Typing indicator (shown before the first stream chunk arrives).
+- Empty state with clickable suggestion chips.
+- Clear chat button (also clears localStorage).
+- **Copy button** on completed assistant messages.
 - Provider dropdown controlled by a feature flag.
-- Markdown rendering for assistant responses.
+- Markdown rendering for assistant responses (after streaming completes).
 - Server-side API route for AI calls.
-- Provider fallback support.
+- Provider fallback support (works in both streaming and non-streaming modes).
 - Environment-controlled provider models.
 - Friendly error messages instead of raw provider JSON errors.
 - Secrets stored in `.env.local`.
@@ -98,8 +103,11 @@ Important source files:
 ├── lib/
 │   ├── ai/
 │   │   ├── providers.ts
+│   │   ├── prompts.ts
 │   │   └── types.ts
-│   └── config.ts
+│   ├── chat-storage.ts
+│   ├── config.ts
+│   └── sse-client.ts
 ├── public/
 │   └── assistant-avatar.svg
 ├── .env.example
@@ -145,6 +153,8 @@ GROQ_MODEL=llama-3.3-70b-versatile
 GEMINI_MODEL=gemini-flash-lite-latest
 HUGGINGFACE_MODEL=meta-llama/Llama-3.1-8B-Instruct
 
+SYSTEM_PROMPT=You are a helpful AI assistant. Answer clearly and accurately.
+
 DEFAULT_AI_PROVIDER=groq
 ALLOW_AI_PROVIDER_SWITCH=false
 ```
@@ -157,6 +167,7 @@ ALLOW_AI_PROVIDER_SWITCH=false
 | `GROQ_MODEL` | Groq model name. |
 | `GEMINI_MODEL` | Gemini model name. |
 | `HUGGINGFACE_MODEL` | Hugging Face model name. |
+| `SYSTEM_PROMPT` | Base system prompt sent to all providers. Appends concise/detailed style instructions based on UI toggle. |
 | `DEFAULT_AI_PROVIDER` | First provider used when no provider is manually selected. |
 | `ALLOW_AI_PROVIDER_SWITCH` | Feature flag that controls whether users can choose the provider in the UI. |
 
@@ -227,17 +238,27 @@ gemini -> groq -> huggingface
 
 ## Application Flow
 
-High-level request flow:
+High-level request flow (streaming — default):
 
 ```text
-User types message
-  -> Chat.tsx updates local message history
-  -> Chat.tsx sends POST /api/chat
+User types message or clicks a suggestion
+  -> Chat.tsx appends user message locally
+  -> Chat.tsx sends POST /api/chat with stream: true
   -> route.ts validates request
-  -> generateChatResponse() picks provider order
-  -> Provider API is called
-  -> Response is returned as JSON
-  -> Chat.tsx renders assistant response
+  -> createChatStream() picks provider order and tries each provider
+  -> Provider API streams tokens back
+  -> Server re-wraps tokens as SSE events (meta, chunk, done, error)
+  -> lib/sse-client.ts parses SSE on the browser
+  -> Chat.tsx appends chunks to the assistant bubble in real time
+  -> After done, markdown is rendered and chat is saved to localStorage
+```
+
+Non-streaming fallback (`stream: false`):
+
+```text
+User sends message
+  -> route.ts calls generateChatResponse()
+  -> Full response returned as JSON { message, provider }
 ```
 
 ## Frontend
@@ -255,13 +276,15 @@ This file contains the complete chat UI.
 | Component / Function | Purpose |
 | --- | --- |
 | `AssistantAvatar` | Renders the assistant bot image from `public/assistant-avatar.svg`. |
-| `TypingIndicator` | Shows animated dots while waiting for a response. |
-| `MessageContent` | Renders user text or assistant markdown. |
+| `TypingIndicator` | Shows animated dots while waiting for the first stream chunk. |
+| `CopyButton` | Copies assistant message text to the clipboard. |
+| `MessageContent` | Renders user text, plain text while streaming, or markdown when complete. |
 | `MessageBubble` | Renders a single user or assistant message bubble. |
 | `EmptyState` | Shows initial empty chat screen and suggestion chips. |
-| `SuggestionChip` | Clickable suggestion text. |
+| `SuggestionChip` | Clickable suggestion that calls `sendMessage()` directly. |
 | `ProviderSelect` | Dropdown for manual provider selection. |
-| `Chat` | Main chat component with state and behavior. |
+| `ReplyModeToggle` | Concise / Detailed toggle sent to the API as `concise: true/false`. |
+| `Chat` | Main chat component with state, streaming, and localStorage. |
 
 ### Frontend State
 
@@ -271,10 +294,32 @@ The chat component keeps these values in React state:
 | --- | --- |
 | `messages` | Full chat history in the browser. |
 | `input` | Current textarea value. |
-| `isLoading` | Whether an AI response is currently being generated. |
+| `isLoading` | Whether an API request is in progress. |
+| `isStreaming` | Whether tokens are still arriving from the server. |
 | `error` | User-friendly error message shown in the UI. |
 | `activeProvider` | Provider that answered the latest message. |
 | `selectedProvider` | Provider selected by the user when the flag is enabled. |
+| `conciseMode` | Whether concise reply style is enabled. |
+| `hydrated` | Whether localStorage has been loaded (avoids hydration mismatch). |
+
+### localStorage Persistence
+
+Chat state is saved in the browser via `lib/chat-storage.ts`:
+
+| Stored field | Purpose |
+| --- | --- |
+| `messages` | Full chat history |
+| `selectedProvider` | User's provider choice |
+| `conciseMode` | Concise / Detailed toggle state |
+| `activeProvider` | Last provider that answered |
+
+Storage key: `ai-chat-storage`
+
+Behavior:
+
+- Loaded once on mount (before rendering the chat UI).
+- Saved after each completed message (not on every streaming token).
+- Cleared when the user clicks **Clear chat**.
 
 ### Sending A Message
 
@@ -285,10 +330,13 @@ The `sendMessage()` function:
 3. appends the user message locally,
 4. clears the input,
 5. sets loading state,
-6. sends a `POST /api/chat` request,
-7. receives `{ message, provider }`,
-8. stores the assistant reply,
-9. updates the active provider label.
+6. sends a `POST /api/chat` request with `stream: true`,
+7. creates an empty assistant message bubble,
+8. reads SSE events via `readChatStream()`,
+9. on `meta` / `done` — updates the active provider label,
+10. on `chunk` — appends text (batched with `requestAnimationFrame` for smooth UI),
+11. on `error` — shows a friendly error and removes empty assistant bubble,
+12. after streaming — renders markdown and saves to localStorage.
 
 ### API Call From Frontend
 
@@ -300,7 +348,9 @@ fetch("/api/chat", {
   headers: { "Content-Type": "application/json" },
   body: JSON.stringify({
     messages: updatedMessages,
-    provider: selectedProvider
+    stream: true,
+    concise: conciseMode,
+    ...(allowProviderSwitch ? { provider: selectedProvider } : {}),
   }),
 });
 ```
@@ -328,6 +378,8 @@ This means assistant responses can format:
 - tables.
 
 User messages are rendered as plain text.
+
+During streaming, assistant messages are rendered as **plain text** (no markdown re-parsing on every token). After streaming completes, `react-markdown` renders the final message.
 
 Markdown styles are defined in:
 
@@ -417,18 +469,49 @@ Because this is a Next.js App Router route handler, there is no separate Express
       "content": "Hello"
     }
   ],
-  "provider": "groq"
+  "provider": "groq",
+  "stream": true,
+  "concise": false
 }
 ```
 
 ### Fields
 
-| Field | Required | Description |
-| --- | --- | --- |
-| `messages` | Yes | Full chat history. |
-| `provider` | No | Optional selected provider. Allowed only when `ALLOW_AI_PROVIDER_SWITCH=true`. |
+| Field | Required | Default | Description |
+| --- | --- | --- | --- |
+| `messages` | Yes | — | Full chat history. |
+| `provider` | No | — | Optional selected provider. Allowed only when `ALLOW_AI_PROVIDER_SWITCH=true`. |
+| `stream` | No | `true` | When `true`, returns SSE stream. When `false`, returns JSON. |
+| `concise` | No | `false` | When `true`, appends concise-style instructions to the system prompt. |
 
-## API Response Body
+## API Response
+
+### Streaming response (default, `stream: true`)
+
+Content-Type: `text/event-stream`
+
+The server sends SSE events, one per line:
+
+```text
+data: {"type":"meta","provider":"groq"}
+
+data: {"type":"chunk","content":"Hello"}
+
+data: {"type":"chunk","content":" there"}
+
+data: {"type":"done","provider":"groq"}
+```
+
+| Event type | Purpose |
+| --- | --- |
+| `meta` | Stream started — which provider is answering. |
+| `chunk` | A piece of assistant text to append. |
+| `done` | Stream finished successfully. |
+| `error` | All providers failed or validation error. |
+
+Validation errors on streaming requests also return SSE with `type: "error"`.
+
+### Non-streaming response (`stream: false`)
 
 Successful response:
 
@@ -458,6 +541,10 @@ The API route validates:
 - requested provider must be valid.
 - requested provider is accepted only when provider switching is enabled.
 
+`stream` and `concise` are optional booleans. Invalid values are treated as defaults (`stream: true`, `concise: false`).
+
+Validation errors on streaming requests return SSE `error` events. Non-streaming requests return JSON `{ error }`.
+
 ## Shared Types
 
 Defined in:
@@ -485,6 +572,72 @@ Provider labels are handled by:
 getProviderLabel(provider)
 ```
 
+## System Prompt
+
+System prompt logic lives in:
+
+```text
+lib/ai/prompts.ts
+```
+
+The base prompt comes from `SYSTEM_PROMPT` in `.env.local`. If missing, a default is used:
+
+```text
+You are a helpful AI assistant. Answer clearly and accurately.
+```
+
+The UI **Concise / Detailed** toggle appends extra style instructions:
+
+| Mode | Extra instruction |
+| --- | --- |
+| Concise | Keep answers concise and to the point unless the user asks for more detail. |
+| Detailed | Provide thorough, detailed answers when helpful. |
+
+How each provider receives the prompt:
+
+| Provider | How system prompt is sent |
+| --- | --- |
+| Groq | Prepended as a `system` role message (OpenAI format). |
+| Hugging Face | Prepended as a `system` role message (OpenAI format). |
+| Gemini | Sent as `systemInstruction.parts` in the request body. |
+
+## Streaming Architecture
+
+### Server side (`lib/ai/providers.ts`)
+
+`createChatStream()` returns a `ReadableStream` that:
+
+1. Builds provider order via `getProviderOrder()`.
+2. Tries each provider with `startProviderStream()`.
+3. On success, emits SSE events to the browser:
+   - `meta` — provider connected
+   - `chunk` — text token(s)
+   - `done` — stream complete
+4. On failure, tries the next provider.
+5. If all fail, emits a single `error` event.
+
+Provider-specific stream parsers:
+
+| Provider | Upstream format | Parser |
+| --- | --- | --- |
+| Groq | OpenAI SSE (`choices[0].delta.content`) | `parseOpenAIStream()` |
+| Hugging Face | OpenAI SSE | `parseOpenAIStream()` |
+| Gemini | Gemini SSE (`candidates[0].content.parts[0].text`) | `parseGeminiStream()` |
+
+### Client side (`lib/sse-client.ts`)
+
+`readChatStream(response)` reads the fetch `Response.body` and yields parsed `ChatStreamEvent` objects:
+
+```ts
+type ChatStreamEvent =
+  | { type: "meta"; provider: AIProvider }
+  | { type: "chunk"; content: string }
+  | { type: "done"; provider: AIProvider }
+  | { type: "error"; error: string };
+```
+
+`Chat.tsx` consumes these events in a `for await` loop inside `sendMessage()`.
+
 ## Provider Implementation
 
 Main provider file:
@@ -497,10 +650,17 @@ This file handles:
 
 - reading provider API keys,
 - formatting request bodies for each provider,
-- calling each provider endpoint,
-- parsing provider responses,
+- calling each provider endpoint (streaming and non-streaming),
+- parsing provider stream responses,
 - fallback behavior,
 - friendly error handling.
+
+Key exported functions:
+
+| Function | Purpose |
+| --- | --- |
+| `createChatStream()` | Main streaming path — returns `ReadableStream` of SSE bytes. |
+| `generateChatResponse()` | Non-streaming fallback — returns `{ message, provider }`. |
 
 ## Groq Integration
 
@@ -510,23 +670,28 @@ Endpoint:
 https://api.groq.com/openai/v1/chat/completions
 ```
 
-Request format:
+Streaming request (`stream: true`):
 
 ```json
 {
   "model": "llama-3.3-70b-versatile",
   "messages": [
-    {
-      "role": "user",
-      "content": "Hello"
-    }
+    { "role": "system", "content": "You are a helpful AI assistant..." },
+    { "role": "user", "content": "Hello" }
   ],
   "temperature": 0.7,
-  "max_tokens": 1024
+  "max_tokens": 1024,
+  "stream": true
 }
 ```
 
-Response parsing:
+Stream chunk parsing:
+
+```ts
+json.choices?.[0]?.delta?.content
+```
+
+Non-streaming response parsing:
 
 ```ts
 data.choices?.[0]?.message?.content
@@ -534,7 +699,13 @@ data.choices?.[0]?.message?.content
 
 ## Gemini Integration
 
-Endpoint pattern:
+Streaming endpoint:
+
+```text
+https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent?alt=sse&key={apiKey}
+```
+
+Non-streaming endpoint:
 
 ```text
 https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={apiKey}
@@ -546,22 +717,37 @@ Current model is read from:
 GEMINI_MODEL=gemini-flash-lite-latest
 ```
 
-Gemini uses a different message format:
+Gemini streaming request includes `systemInstruction` and `contents`:
 
-```ts
-const contents = messages.map((m) => ({
-  role: m.role === "assistant" ? "model" : "user",
-  parts: [{ text: m.content }],
-}));
+```json
+{
+  "systemInstruction": {
+    "parts": [{ "text": "You are a helpful AI assistant..." }]
+  },
+  "contents": [
+    { "role": "user", "parts": [{ "text": "Hello" }] }
+  ],
+  "generationConfig": {
+    "temperature": 0.7,
+    "maxOutputTokens": 1024
+  }
+}
 ```
 
 Why:
 
 - app roles are `user` and `assistant`,
 - Gemini expects `user` and `model`,
-- Gemini content is sent inside `parts`.
+- Gemini content is sent inside `parts`,
+- system prompt is sent via `systemInstruction`, not as a message role.
 
-Response parsing:
+Stream chunk parsing:
+
+```ts
+json.candidates?.[0]?.content?.parts?.[0]?.text
+```
+
+Non-streaming response parsing:
 
 ```ts
 data.candidates?.[0]?.content?.parts?.[0]?.text
@@ -581,24 +767,28 @@ Current model is read from:
 HUGGINGFACE_MODEL=meta-llama/Llama-3.1-8B-Instruct
 ```
 
-Hugging Face uses an OpenAI-compatible format:
+Hugging Face streaming request (`stream: true`):
 
 ```json
 {
   "model": "meta-llama/Llama-3.1-8B-Instruct",
   "messages": [
-    {
-      "role": "user",
-      "content": "Hello"
-    }
+    { "role": "system", "content": "You are a helpful AI assistant..." },
+    { "role": "user", "content": "Hello" }
   ],
   "temperature": 0.7,
   "max_tokens": 1024,
-  "stream": false
+  "stream": true
 }
 ```
 
-Response parsing:
+Stream chunk parsing:
+
+```ts
+json.choices?.[0]?.delta?.content
+```
+
+Non-streaming response parsing:
 
 ```ts
 data.choices?.[0]?.message?.content
@@ -632,11 +822,10 @@ Raw provider errors are logged only on the server with `console.error`.
 
 ## Fallback Behavior
 
-Fallback happens inside:
+Fallback happens inside both:
 
-```ts
-generateChatResponse(messages, selectedProvider)
-```
+- `createChatStream()` — streaming path (default)
+- `generateChatResponse()` — non-streaming path
 
 Behavior:
 
@@ -644,7 +833,7 @@ Behavior:
 2. Try first provider.
 3. If it fails, save the friendly error.
 4. Try next provider.
-5. Return the first successful response.
+5. Return / stream the first successful response.
 6. If all fail, return a short combined error message.
 
 Example:
@@ -654,7 +843,7 @@ Selected provider: gemini
 Provider order: gemini -> groq -> huggingface
 ```
 
-If Gemini is out of quota, Groq is tried next.
+If Gemini is out of quota, Groq is tried next. The UI shows `via Groq` even if the user selected Gemini.
 
 ## Configuration Layer
 
@@ -745,7 +934,34 @@ http://localhost:3000
 
 ## Testing The API Manually
 
-Use curl:
+### Streaming (default)
+
+```bash
+curl -N -X POST http://localhost:3000/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [
+      {
+        "role": "user",
+        "content": "Say hello in one word"
+      }
+    ],
+    "provider": "groq",
+    "stream": true
+  }'
+```
+
+Expected output (SSE lines):
+
+```text
+data: {"type":"meta","provider":"groq"}
+
+data: {"type":"chunk","content":"Hello"}
+
+data: {"type":"done","provider":"groq"}
+```
+
+### Non-streaming
 
 ```bash
 curl -X POST http://localhost:3000/api/chat \
@@ -757,7 +973,8 @@ curl -X POST http://localhost:3000/api/chat \
         "content": "Say hello in one word"
       }
     ],
-    "provider": "groq"
+    "provider": "groq",
+    "stream": false
   }'
 ```
 
@@ -826,6 +1043,22 @@ npm run dev
 
 No code changes are needed.
 
+## Changing The System Prompt
+
+Edit `.env.local`:
+
+```env
+SYSTEM_PROMPT=You are a friendly coding tutor. Explain concepts simply.
+```
+
+Restart:
+
+```bash
+npm run dev
+```
+
+The concise/detailed toggle still appends its style instructions on top of this base prompt.
+
 ## Security Notes
 
 - Never expose real API keys in client-side code.
@@ -891,16 +1124,17 @@ suppressHydrationWarning
 
 in `app/layout.tsx`.
 
-### Markdown looked unformatted
+### Streaming looks choppy or flickers
 
-Assistant messages are now rendered with `react-markdown`.
+The UI intentionally renders plain text during streaming and markdown only after `done`. Chunks are batched with `requestAnimationFrame` to reduce re-renders.
 
-If markdown looks wrong, check:
+### Chat history lost after refresh
 
-- `components/Chat.tsx`
-- `app/globals.css`
-- `react-markdown` dependency
-- `remark-gfm` dependency
+Chat is stored in `localStorage` under key `ai-chat-storage`. If history is missing:
+
+- check browser privacy settings (localStorage blocked),
+- check if **Clear chat** was clicked,
+- check DevTools → Application → Local Storage.
 
 ## Build Verification
 
@@ -910,32 +1144,29 @@ Run:
 npm run build
 ```
 
-The latest build completed successfully after markdown changes.
+This verifies TypeScript types and Next.js compilation across all updated files.
 
 ## Known Notes
 
-- The current app keeps chat history only in browser memory.
-- Refreshing the page clears messages.
-- There is no database.
+- Chat history is persisted in browser `localStorage` (not a database).
 - There is no authentication.
-- There is no streaming response yet.
-- All provider calls are non-streaming.
+- Streaming is the default API mode (`stream: true`).
+- Non-streaming JSON mode is available via `stream: false`.
 - The API expects the client to send the full message history.
+- Provider fallback works in both streaming and non-streaming modes.
 - The app is meant as a simple demo foundation.
 
 ## Possible Future Improvements
 
-- Add streaming responses.
-- Add database-backed chat history.
-- Add user accounts.
-- Add system prompt configuration.
+- Add database-backed chat history (replace or supplement localStorage).
+- Add user accounts and authentication.
+- Add chat sessions sidebar (multiple conversations).
 - Add token limits and message trimming.
-- Add per-provider model dropdown.
+- Add per-provider model dropdown in the UI.
 - Add retry button on failed messages.
-- Add copy button for assistant messages.
-- Add syntax highlighting for code blocks.
+- Add syntax highlighting for code blocks in markdown.
 - Add rate limiting on `/api/chat`.
-- Add tests for provider fallback behavior.
+- Add tests for provider fallback and streaming behavior.
 - Add deployment configuration for Vercel or another host.
 
 ## Quick Reference
@@ -944,7 +1175,10 @@ The latest build completed successfully after markdown changes.
 | --- | --- |
 | Change UI | `components/Chat.tsx` |
 | Change API validation | `app/api/chat/route.ts` |
-| Change provider logic | `lib/ai/providers.ts` |
+| Change provider / streaming logic | `lib/ai/providers.ts` |
+| Change system prompt | `lib/ai/prompts.ts` or `SYSTEM_PROMPT` in `.env.local` |
+| Change SSE client parser | `lib/sse-client.ts` |
+| Change localStorage behavior | `lib/chat-storage.ts` |
 | Change env parsing | `lib/config.ts` |
 | Change shared types | `lib/ai/types.ts` |
 | Change theme | `app/globals.css` |
@@ -952,7 +1186,7 @@ The latest build completed successfully after markdown changes.
 | Change models | `.env.local` |
 | Change provider flag | `.env.local` |
 
-## End-To-End Example
+## End-To-End Example (Streaming)
 
 Request:
 
@@ -964,17 +1198,24 @@ Request:
       "content": "Write a haiku about coding"
     }
   ],
-  "provider": "gemini"
+  "provider": "gemini",
+  "stream": true,
+  "concise": true
 }
 ```
 
-Response:
+SSE response (simplified):
 
-```json
-{
-  "message": "Silent keys awake\nLogic blooms in glowing lines\nBugs fade into dawn",
-  "provider": "gemini"
-}
+```text
+data: {"type":"meta","provider":"gemini"}
+
+data: {"type":"chunk","content":"Silent keys awake\n"}
+
+data: {"type":"chunk","content":"Logic blooms in glowing lines\n"}
+
+data: {"type":"chunk","content":"Bugs fade into dawn"}
+
+data: {"type":"done","provider":"gemini"}
 ```
 
-The response provider can be different if fallback was needed.
+The response provider can be different if fallback was needed (e.g. `groq` instead of `gemini`).
