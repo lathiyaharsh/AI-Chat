@@ -59,7 +59,7 @@ Track progress by changing `[ ]` to `[x]` as you complete each item.
 - [x] Understand `invoke` vs `stream` vs `ainvoke` / `astream`
 - [x] Parse string output with `StrOutputParser`
 - [x] Pass conversation history into the prompt
-- [ ] Add concise vs detailed reply style via prompt variables
+- [x] Add concise vs detailed reply style via prompt variables
 - [x] Wire LangChain streaming into FastAPI `StreamingResponse`
 - [ ] Log latency and token/provider errors in a readable way
 
@@ -82,15 +82,15 @@ Track progress by changing `[ ]` to `[x]` as you complete each item.
 
 ## Phase 3 — LlamaIndex + RAG
 
-- [ ] Understand RAG: load → chunk → embed → index → retrieve → generate
-- [ ] Load local documents (`.md`, `.txt`, or PDF)
-- [ ] Split / chunk documents
-- [ ] Create a vector index (start with local / simple store)
-- [ ] Query the index with a natural-language question
-- [ ] Inspect retrieved source nodes / citations
+- [x] Understand RAG: load → chunk → embed → index → retrieve → generate
+- [x] Load local documents (`.md`, `.txt`, or PDF)
+- [x] Split / chunk documents
+- [x] Create a vector index (start with local / simple store)
+- [x] Query the index with a natural-language question
+- [x] Inspect retrieved source nodes / citations
 - [ ] Tune chunk size and top-k retrieval
-- [ ] Wrap RAG in a FastAPI `POST /rag` endpoint
-- [ ] Return answer + source snippets in the JSON response
+- [x] Wrap RAG in a FastAPI `POST /rag` endpoint
+- [x] Return answer + source snippets in the JSON response
 - [ ] (Optional) Stream RAG answers over SSE
 - [ ] (Optional) Persist the index to disk and reload on startup
 - [ ] (Optional) Add an ingest endpoint to upload new files
@@ -173,9 +173,10 @@ Track progress by changing `[ ]` to `[x]` as you complete each item.
 | 2026-07-14 | Phase 0: venv, packages, .env, hello FastAPI + /docs | requirements.txt so others can reproduce |
 | 2026-07-14 | Phase 1: POST /chat, CORS, .env, HTTPException, SSE stream | Echo + fake token stream before LLM |
 | 2026-07-14 | Phase 2: Groq chain, astream, session memory | Remember name across turns |
+| 2026-07-14 | Phase 3 core: POST /rag + sources + comments | First call slow; edit .md needs index rebuild |
 
 ---
 
 ## Current focus
 
-> Phase 2 — LangChain + Groq (real LLM replies)
+> Phase 3 core done — next: Phase 4 (compare LangChain vs LlamaIndex) or optional RAG rebuild endpoint / tools
