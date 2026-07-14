@@ -23,6 +23,7 @@ load_dotenv()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
+
 def build_chat_chain():
     if not GROQ_API_KEY or GROQ_API_KEY.startswith("your_"):
         raise HTTPException(
@@ -48,6 +49,7 @@ def build_chat_chain():
 
     # LCEL: prompt fills template → model generates → parser returns a string
     return prompt | model | StrOutputParser()
+
 
 app = FastAPI(title="AI Chat Learning Backend")
 
@@ -105,23 +107,30 @@ def chat(request: ChatRequest):
 
     return ChatResponse(reply=reply)
 
+
 @app.post("/chat/stream")
 async def chat_stream(request: ChatRequest):
-    """Fake token stream — practice SSE before real LLM streaming."""
+    """Stream real Groq tokens over SSE via LangChain."""
     message = request.message.strip()
     if not message:
         raise HTTPException(status_code=400, detail="Message cannot be empty.")
 
-    full_reply = f"You said: {message}"
+    try:
+        chain = build_chat_chain()
+    except HTTPException:
+        raise
 
     async def event_generator():
-        # Send one word at a time (simulates LLM tokens)
-        for word in full_reply.split(" "):
-            chunk = word + " "
-            # SSE format: each event is "data: ...\n\n"
-            yield f"data: {chunk}\n\n"
-            await asyncio.sleep(0.15)  # slow enough to see streaming
-        yield "data: [DONE]\n\n"
+        try:
+            # astream = async streaming (one chunk at a time)
+            async for chunk in chain.astream({"message": message}):
+                if chunk:
+                    # Escape newlines so SSE stays one event per chunk
+                    safe = chunk.replace("\n", "\\n")
+                    yield f"data: {safe}\n\n"
+            yield "data: [DONE]\n\n"
+        except Exception as exc:
+            yield f"data: [ERROR] {exc}\n\n"
 
     return StreamingResponse(
         event_generator(),

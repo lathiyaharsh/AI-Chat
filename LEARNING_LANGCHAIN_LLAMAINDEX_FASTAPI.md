@@ -56,11 +56,11 @@ Track progress by changing `[ ]` to `[x]` as you complete each item.
 - [x] Call a chat model directly (no chain yet)
 - [x] Use `ChatPromptTemplate` with system + human messages
 - [x] Build a simple LCEL chain: `prompt | model | parser`
-- [ ] Understand `invoke` vs `stream` vs `ainvoke` / `astream`
+- [x] Understand `invoke` vs `stream` vs `ainvoke` / `astream`
 - [x] Parse string output with `StrOutputParser`
 - [ ] Pass conversation history into the prompt
 - [ ] Add concise vs detailed reply style via prompt variables
-- [ ] Wire LangChain streaming into FastAPI `StreamingResponse`
+- [x] Wire LangChain streaming into FastAPI `StreamingResponse`
 - [ ] Log latency and token/provider errors in a readable way
 
 ### Memory
