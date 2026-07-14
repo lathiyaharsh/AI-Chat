@@ -54,20 +54,22 @@ chat_sessions: dict[str, list] = {}
 # ---------------------------------------------------------------------------
 # LlamaIndex RAG helpers
 # ---------------------------------------------------------------------------
-def get_rag_index() -> VectorStoreIndex:
+def get_rag_index(*, force_rebuild: bool = False) -> VectorStoreIndex:
     """
     Build (or return cached) vector index over DATA_DIR.
 
-    Steps on first call (slow):
+    Steps on first call / rebuild (slower):
       1. Configure Groq as the answer LLM
       2. Configure local HuggingFace embeddings (text → vectors)
       3. Load every file under data/
       4. Chunk + embed documents into VectorStoreIndex
 
-    Later calls just return the cached `rag_index` (fast).
+    Later calls with force_rebuild=False return the cached `rag_index` (fast).
+
+    Pass force_rebuild=True after editing files in DATA_DIR so answers use new text.
     """
     global rag_index
-    if rag_index is not None:
+    if rag_index is not None and not force_rebuild:
         return rag_index
 
     if not GROQ_API_KEY or GROQ_API_KEY.startswith("your_"):
@@ -293,3 +295,25 @@ def rag(request: RagRequest):
         raise
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"RAG error: {exc}") from exc
+
+
+@app.post("/rag/rebuild")
+def rag_rebuild():
+    """
+    Re-read backend/data/ and rebuild the vector index.
+
+    Use this after editing .md files so /rag sees the new content
+    without restarting uvicorn.
+    """
+    try:
+        get_rag_index(force_rebuild=True)
+        file_count = len(list(DATA_DIR.glob("*"))) if DATA_DIR.exists() else 0
+        return {
+            "status": "rebuilt",
+            "data_dir": str(DATA_DIR),
+            "files_seen": file_count,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Rebuild error: {exc}") from exc

@@ -91,6 +91,7 @@ Track progress by changing `[ ]` to `[x]` as you complete each item.
 - [ ] Tune chunk size and top-k retrieval
 - [x] Wrap RAG in a FastAPI `POST /rag` endpoint
 - [x] Return answer + source snippets in the JSON response
+- [x] Add `POST /rag/rebuild` so editing `data/` updates answers without restart
 - [ ] (Optional) Stream RAG answers over SSE
 - [ ] (Optional) Persist the index to disk and reload on startup
 - [ ] (Optional) Add an ingest endpoint to upload new files
@@ -179,4 +180,4 @@ Track progress by changing `[ ]` to `[x]` as you complete each item.
 
 ## Current focus
 
-> Phase 3 core done — next: Phase 4 (compare LangChain vs LlamaIndex) or optional RAG rebuild endpoint / tools
+> Added POST /rag/rebuild — next recommended: Phase 4 (LangChain vs LlamaIndex mental model)
