@@ -2,20 +2,39 @@
 Phase 1 — FastAPI fundamentals
 
 POST /chat accepts a message and returns an echo reply.
-No LangChain yet — that comes in Phase 2.
+Loads settings from .env and allows the Next.js frontend via CORS.
 """
 
-from fastapi import FastAPI
+import os
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+
+# Load backend/.env into environment variables
+load_dotenv()
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 app = FastAPI(title="AI Chat Learning Backend")
 
+# Allow Next.js (default :3000) to call this API from the browser
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# --- Request / response models (Pydantic) ---
 
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=2000)
-    # Field(...) means required. min/max = automatic validation.
 
 
 class ChatResponse(BaseModel):
@@ -29,10 +48,19 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        # Never return the real API key — only whether it is set
+        "groq_key_configured": bool(GROQ_API_KEY and not GROQ_API_KEY.startswith("your_")),
+        "groq_model": GROQ_MODEL,
+    }
 
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(request: ChatRequest):
-    """Echo chat — learns the API shape before we plug in an LLM."""
-    return ChatResponse(reply=f"You said: {request.message}")
+    message = request.message.strip()
+    if not message:
+        # Extra check beyond Pydantic (e.g. message is only spaces)
+        raise HTTPException(status_code=400, detail="Message cannot be empty.")
+
+    return ChatResponse(reply=f"You said: {message}")

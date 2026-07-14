@@ -34,9 +34,9 @@ Track progress by changing `[ ]` to `[x]` as you complete each item.
 - [x] Define a Pydantic request model (e.g. `ChatRequest`)
 - [x] Define a Pydantic response model (e.g. `ChatResponse`)
 - [x] Return JSON from a POST `/chat` endpoint
-- [ ] Add CORS so a Next.js frontend can call the API
-- [ ] Load settings from environment variables
-- [ ] Add basic error handling (`HTTPException`)
+- [x] Add CORS so a Next.js frontend can call the API
+- [x] Load settings from environment variables
+- [x] Add basic error handling (`HTTPException`)
 - [x] Add request validation (message length / count limits)
 - [x] Write a health check endpoint `GET /health`
 - [ ] (Optional) Split routers: `routers/chat.py`, `routers/rag.py`
