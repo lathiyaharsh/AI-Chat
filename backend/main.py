@@ -13,12 +13,41 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from langchain_groq import ChatGroq
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
 
 # Load backend/.env into environment variables
 load_dotenv()
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+
+def build_chat_chain():
+    if not GROQ_API_KEY or GROQ_API_KEY.startswith("your_"):
+        raise HTTPException(
+            status_code=500,
+            detail="GROQ_API_KEY is not configured in backend/.env",
+        )
+
+    model = ChatGroq(
+        api_key=GROQ_API_KEY,
+        model=GROQ_MODEL,
+        temperature=0.7,
+    )
+
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "You are a helpful assistant. Answer clearly and briefly.",
+            ),
+            ("human", "{message}"),
+        ]
+    )
+
+    # LCEL: prompt fills template → model generates → parser returns a string
+    return prompt | model | StrOutputParser()
 
 app = FastAPI(title="AI Chat Learning Backend")
 
@@ -64,11 +93,17 @@ def health():
 def chat(request: ChatRequest):
     message = request.message.strip()
     if not message:
-        # Extra check beyond Pydantic (e.g. message is only spaces)
         raise HTTPException(status_code=400, detail="Message cannot be empty.")
 
-    return ChatResponse(reply=f"You said: {message}")
+    try:
+        chain = build_chat_chain()
+        reply = chain.invoke({"message": message})
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"LLM error: {exc}") from exc
 
+    return ChatResponse(reply=reply)
 
 @app.post("/chat/stream")
 async def chat_stream(request: ChatRequest):

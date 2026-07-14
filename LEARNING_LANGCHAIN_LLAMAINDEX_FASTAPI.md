@@ -53,11 +53,11 @@ Track progress by changing `[ ]` to `[x]` as you complete each item.
 
 ## Phase 2 — LangChain basics
 
-- [ ] Call a chat model directly (no chain yet)
-- [ ] Use `ChatPromptTemplate` with system + human messages
-- [ ] Build a simple LCEL chain: `prompt | model | parser`
+- [x] Call a chat model directly (no chain yet)
+- [x] Use `ChatPromptTemplate` with system + human messages
+- [x] Build a simple LCEL chain: `prompt | model | parser`
 - [ ] Understand `invoke` vs `stream` vs `ainvoke` / `astream`
-- [ ] Parse string output with `StrOutputParser`
+- [x] Parse string output with `StrOutputParser`
 - [ ] Pass conversation history into the prompt
 - [ ] Add concise vs detailed reply style via prompt variables
 - [ ] Wire LangChain streaming into FastAPI `StreamingResponse`

@@ -13,8 +13,12 @@ cp .env.example .env               # then put your real GROQ_API_KEY in .env
 
 ## Run
 
+Always activate the venv first (or call `.venv/bin/uvicorn` directly).
+If you run system `uvicorn` outside the venv, imports like `langchain_groq` will fail.
+
 ```bash
 source .venv/bin/activate
+which uvicorn   # should be .../backend/.venv/bin/uvicorn
 uvicorn main:app --reload --host 127.0.0.1 --port 8000
 ```
 
