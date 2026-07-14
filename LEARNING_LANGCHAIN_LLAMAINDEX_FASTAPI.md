@@ -58,16 +58,16 @@ Track progress by changing `[ ]` to `[x]` as you complete each item.
 - [x] Build a simple LCEL chain: `prompt | model | parser`
 - [x] Understand `invoke` vs `stream` vs `ainvoke` / `astream`
 - [x] Parse string output with `StrOutputParser`
-- [ ] Pass conversation history into the prompt
+- [x] Pass conversation history into the prompt
 - [ ] Add concise vs detailed reply style via prompt variables
 - [x] Wire LangChain streaming into FastAPI `StreamingResponse`
 - [ ] Log latency and token/provider errors in a readable way
 
 ### Memory
 
-- [ ] Understand chat message types (`SystemMessage`, `HumanMessage`, `AIMessage`)
-- [ ] Keep per-session history in memory (dict / store)
-- [ ] Clear session history via an API endpoint
+- [x] Understand chat message types (`SystemMessage`, `HumanMessage`, `AIMessage`)
+- [x] Keep per-session history in memory (dict / store)
+- [x] Clear session history via an API endpoint
 - [ ] (Optional) Persist history (Redis / SQLite / file)
 
 ### Tools & agents (intro)
@@ -172,6 +172,7 @@ Track progress by changing `[ ]` to `[x]` as you complete each item.
 | --- | --- | --- |
 | 2026-07-14 | Phase 0: venv, packages, .env, hello FastAPI + /docs | requirements.txt so others can reproduce |
 | 2026-07-14 | Phase 1: POST /chat, CORS, .env, HTTPException, SSE stream | Echo + fake token stream before LLM |
+| 2026-07-14 | Phase 2: Groq chain, astream, session memory | Remember name across turns |
 
 ---
 
