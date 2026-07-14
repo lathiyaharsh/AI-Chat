@@ -6,7 +6,9 @@ Loads settings from .env and allows the Next.js frontend via CORS.
 """
 
 import os
+import asyncio
 
+from fastapi.responses import StreamingResponse
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -51,7 +53,9 @@ def health():
     return {
         "status": "ok",
         # Never return the real API key — only whether it is set
-        "groq_key_configured": bool(GROQ_API_KEY and not GROQ_API_KEY.startswith("your_")),
+        "groq_key_configured": bool(
+            GROQ_API_KEY and not GROQ_API_KEY.startswith("your_")
+        ),
         "groq_model": GROQ_MODEL,
     }
 
@@ -64,3 +68,27 @@ def chat(request: ChatRequest):
         raise HTTPException(status_code=400, detail="Message cannot be empty.")
 
     return ChatResponse(reply=f"You said: {message}")
+
+
+@app.post("/chat/stream")
+async def chat_stream(request: ChatRequest):
+    """Fake token stream — practice SSE before real LLM streaming."""
+    message = request.message.strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="Message cannot be empty.")
+
+    full_reply = f"You said: {message}"
+
+    async def event_generator():
+        # Send one word at a time (simulates LLM tokens)
+        for word in full_reply.split(" "):
+            chunk = word + " "
+            # SSE format: each event is "data: ...\n\n"
+            yield f"data: {chunk}\n\n"
+            await asyncio.sleep(0.15)  # slow enough to see streaming
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+    )

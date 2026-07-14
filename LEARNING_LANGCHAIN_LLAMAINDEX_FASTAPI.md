@@ -43,10 +43,10 @@ Track progress by changing `[ ]` to `[x]` as you complete each item.
 
 ### Streaming (match the Next.js chat UX)
 
-- [ ] Understand SSE (Server-Sent Events) conceptually
-- [ ] Return a `StreamingResponse` that yields tokens
-- [ ] Stream plain text chunks from a dummy generator
-- [ ] Stream events in a format your frontend can parse
+- [x] Understand SSE (Server-Sent Events) conceptually
+- [x] Return a `StreamingResponse` that yields tokens
+- [x] Stream plain text chunks from a dummy generator
+- [x] Stream events in a format your frontend can parse
 - [ ] Handle client disconnect / cancellation
 
 ---
@@ -171,9 +171,10 @@ Track progress by changing `[ ]` to `[x]` as you complete each item.
 | Date | What I finished | Blockers / learnings |
 | --- | --- | --- |
 | 2026-07-14 | Phase 0: venv, packages, .env, hello FastAPI + /docs | requirements.txt so others can reproduce |
+| 2026-07-14 | Phase 1: POST /chat, CORS, .env, HTTPException, SSE stream | Echo + fake token stream before LLM |
 
 ---
 
 ## Current focus
 
-> Phase 1 — FastAPI fundamentals (Pydantic models + POST /chat)
+> Phase 2 — LangChain + Groq (real LLM replies)
