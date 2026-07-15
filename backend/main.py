@@ -6,6 +6,10 @@ What this file does:
   - LangChain + Groq for chat (/chat, /chat/stream, session memory)
   - LlamaIndex RAG over ./data (/rag) with vectors in Supabase pgvector
 
+Two kinds of "session" (both in-memory, lost on server restart):
+  - chat_sessions  → general chat (/chat) — LangChain message history
+  - rag_sessions   → doc Q&A (/rag) — LlamaIndex chat engine per session
+
 Run (from backend/, with venv active):
   uvicorn main:app --reload --host 127.0.0.1 --port 8000
   Docs: http://127.0.0.1:8000/docs
@@ -33,10 +37,15 @@ from llama_index.core import (
     StorageContext,
 )
 from llama_index.llms.groq import Groq
+
 # Cloud embeddings via HF Inference API (no local torch ~2GB)
 from llama_index.embeddings.huggingface_api import HuggingFaceInferenceAPIEmbedding
+
 # Persist vectors in Supabase Postgres (pgvector) instead of RAM only
 from llama_index.vector_stores.supabase import SupabaseVectorStore
+from llama_index.core.chat_engine.types import BaseChatEngine, ChatMode
+
+# ChatMode.CONDENSE_QUESTION = rewrite follow-ups ("who set it?") into full questions
 import vecs  # low-level client used to delete collections on rebuild
 
 # =============================================================================
@@ -61,11 +70,19 @@ SUPABASE_COLLECTION = os.getenv("SUPABASE_COLLECTION", "ai_chat_docs")
 # Markdown files for RAG (lab-secret.md, project-notes.md, …)
 DATA_DIR = Path(__file__).parent / "data"
 
-# Cached LlamaIndex handle in this Python process (vectors themselves live in Supabase)
+# ---------------------------------------------------------------------------
+# In-process caches (not the same as Supabase — these reset when uvicorn restarts)
+# ---------------------------------------------------------------------------
+
+# Document index: one shared index for all RAG sessions (vectors live in Supabase)
 rag_index: VectorStoreIndex | None = None
 
-# Chat memory: session_id → list of HumanMessage / AIMessage (lost on server restart)
+# /chat memory: session_id → list of HumanMessage / AIMessage
 chat_sessions: dict[str, list] = {}
+
+# /rag memory: session_id → LlamaIndex chat engine (holds its own Q&A history)
+# Same session_id on /chat and /rag does NOT share memory — they are separate dicts.
+rag_sessions: dict[str, BaseChatEngine] = {}
 
 
 # =============================================================================
@@ -143,7 +160,8 @@ def _collection_is_empty(vector_store: SupabaseVectorStore) -> bool:
     try:
         collection = vector_store._collection
         if collection is None:
-            return True
+            return True  # no collection yet → treat as empty, will ingest
+        # Dummy vector search: if zero rows, Supabase has no embeddings yet
         rows = collection.query(
             data=[0.0] * HF_EMBED_DIM,
             limit=1,
@@ -201,9 +219,13 @@ def get_rag_index(*, force_rebuild: bool = False) -> VectorStoreIndex:
 
     Call with force_rebuild=True after editing files in DATA_DIR.
     """
-    global rag_index
+    global rag_index, rag_sessions
     if rag_index is not None and not force_rebuild:
         return rag_index
+
+    if force_rebuild:
+        # Old chat engines still point at the previous index — drop them all
+        rag_sessions.clear()
 
     if not GROQ_API_KEY or GROQ_API_KEY.startswith("your_"):
         raise HTTPException(status_code=500, detail="GROQ_API_KEY is not configured")
@@ -228,6 +250,44 @@ def get_rag_index(*, force_rebuild: bool = False) -> VectorStoreIndex:
     return rag_index
 
 
+def get_rag_chat_engine(session_id: str) -> BaseChatEngine:
+    """
+      Return a per-session RAG chat engine with conversation memory.
+
+      Why not use query_engine.query()?
+        - query() is stateless — each question is independent
+        - chat() remembers prior turns in this session
+
+    CONDENSE_QUESTION flow (simplified):
+        Turn 1: "What is the fridge password?"
+          → search docs → answer "BANANA-42"
+        Turn 2: "Who set it?"
+          → LLM rewrites to "Who set the fridge password?"
+          → search docs again with the full question → answer
+
+      Example: use session_id "docs-1" on every /rag call in one conversation.
+    """
+    if session_id in rag_sessions:
+        return rag_sessions[session_id]
+
+    index = get_rag_index()
+    engine = index.as_chat_engine(
+        chat_mode=ChatMode.CONDENSE_QUESTION,
+        similarity_top_k=3,  # pass top 3 doc chunks to Groq for the answer
+    )
+    rag_sessions[session_id] = engine
+    return engine
+
+
+def _format_rag_sources(source_nodes) -> list[str]:
+    """Short previews of retrieved chunks — shows what grounded the answer."""
+    sources: list[str] = []
+    for node in source_nodes or []:
+        text = node.get_content()
+        sources.append(text[:240] + ("..." if len(text) > 240 else ""))
+    return sources
+
+
 # =============================================================================
 # CHAT HELPERS — LangChain + Groq
 # =============================================================================
@@ -239,9 +299,11 @@ def get_model() -> ChatGroq:
             detail="GROQ_API_KEY is not configured in backend/.env",
         )
     return ChatGroq(
-        api_key=SecretStr(GROQ_API_KEY),
+        api_key=SecretStr(
+            GROQ_API_KEY
+        ),  # Pydantic SecretStr — type checker expects this
         model=GROQ_MODEL,
-        temperature=0.7,
+        temperature=0.7,  # higher = more creative; lower = more focused
     )
 
 
@@ -306,6 +368,8 @@ class ChatResponse(BaseModel):
 
 class RagRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=2000)
+    # Reuse the same session_id across calls for follow-up questions
+    session_id: str = Field(default="default", min_length=1, max_length=64)
 
 
 class RagResponse(BaseModel):
@@ -355,9 +419,7 @@ def chat(request: ChatRequest):
 
     try:
         model = get_model()
-        messages = build_messages(
-            request.session_id, message, request.reply_mode
-        )
+        messages = build_messages(request.session_id, message, request.reply_mode)
         ai_message = model.invoke(messages)
         reply = (
             ai_message.content
@@ -379,16 +441,14 @@ async def chat_stream(request: ChatRequest):
     Stream tokens over SSE as Groq generates them.
 
     Event format: data: <chunk>\\n\\n  then  data: [DONE]\\n\\n
-  """
+    """
     message = request.message.strip()
     if not message:
         raise HTTPException(status_code=400, detail="Message cannot be empty.")
 
     try:
         model = get_model()
-        messages = build_messages(
-            request.session_id, message, request.reply_mode
-        )
+        messages = build_messages(request.session_id, message, request.reply_mode)
     except HTTPException:
         raise
 
@@ -419,8 +479,13 @@ def clear_session(session_id: str):
 # =============================================================================
 # ROUTES — RAG (LlamaIndex + Supabase)
 #
-# Flow: question → embed → search Supabase → top chunks → Groq answer
-# Test: {"question": "What is the fridge password?"} → BANANA-42 from lab-secret.md
+# Stateless part: document vectors in Supabase (survives restart)
+# Stateful part:  rag_sessions (conversation memory, in RAM only)
+#
+# Test flow in /docs:
+#   1. POST /rag/rebuild
+#   2. POST /rag  {"question": "What is the fridge password?", "session_id": "docs-1"}
+#   3. POST /rag  {"question": "Who set it?", "session_id": "docs-1"}
 # =============================================================================
 @app.post("/rag", response_model=RagResponse)
 def rag(request: RagRequest):
@@ -429,21 +494,26 @@ def rag(request: RagRequest):
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
 
     try:
-        index = get_rag_index()
-        # top_k = how many document chunks to pass to the LLM
-        engine = index.as_query_engine(similarity_top_k=3)
-        result = engine.query(question)
+        # One chat engine per session_id — memory lives inside the engine
+        chat_engine = get_rag_chat_engine(request.session_id)
+        # chat() = condense follow-up → retrieve chunks → Groq answer → save turn
+        result = chat_engine.chat(question)
 
-        sources: list[str] = []
-        for node in getattr(result, "source_nodes", []) or []:
-            text = node.get_content()
-            sources.append(text[:240] + ("..." if len(text) > 240 else ""))
-
-        return RagResponse(answer=str(result), sources=sources)
+        return RagResponse(
+            answer=result.response,
+            sources=_format_rag_sources(result.source_nodes),
+        )
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"RAG error: {exc}") from exc
+
+
+@app.delete("/rag/session/{session_id}")
+def clear_rag_session(session_id: str):
+    """Forget RAG conversation for one session (does not delete Supabase vectors)."""
+    rag_sessions.pop(session_id, None)
+    return {"cleared": session_id}
 
 
 @app.post("/rag/rebuild")
