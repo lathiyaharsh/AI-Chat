@@ -4,5 +4,10 @@
     "${workspaceFolder}/backend",
     "${workspaceFolder}/backend/.venv/lib/python3.10/site-packages"
   ],
-  "python.analysis.diagnosticMode": "workspace"
+  "python.analysis.diagnosticMode": "workspace",
+  "python.analysis.useLibraryCodeForTypes": true,
+  "python.analysis.packageIndexDepths": [
+    { "name": "llama_index", "depth": 5, "includeAllSymbols": true },
+    { "name": "", "depth": 2 }
+  ]
 }

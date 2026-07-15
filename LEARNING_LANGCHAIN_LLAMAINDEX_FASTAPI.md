@@ -93,17 +93,26 @@ Track progress by changing `[ ]` to `[x]` as you complete each item.
 - [x] Return answer + source snippets in the JSON response
 - [x] Add `POST /rag/rebuild` so editing `data/` updates answers without restart
 - [ ] (Optional) Stream RAG answers over SSE
-- [ ] (Optional) Persist the index to disk and reload on startup
+- [x] Persist vectors in Supabase pgvector (survives restart)
 - [ ] (Optional) Add an ingest endpoint to upload new files
 
 ---
 
 ## Phase 4 — LangChain vs LlamaIndex (know the split)
 
-- [ ] Can explain: LangChain = orchestration / agents / tools
-- [ ] Can explain: LlamaIndex = data ingestion / retrieval / RAG
+- [x] Can explain: LangChain = orchestration / agents / tools
+- [x] Can explain: LlamaIndex = data ingestion / retrieval / RAG
 - [ ] Build one flow that uses **LlamaIndex for retrieval** and **LangChain (or plain LLM) for answering**
-- [ ] Document in notes: which library you prefer for which task
+- [x] Document in notes: which library you prefer for which task
+
+### Your notes (filled in during learning)
+
+| Need | Prefer |
+| --- | --- |
+| Chat API, memory, streaming, tools/agents | **LangChain** (what `/chat` uses) |
+| Load docs, embed, search, grounded Q&A | **LlamaIndex** (what `/rag` uses) |
+| FastAPI | HTTP layer for both |
+| Later hybrid | LlamaIndex retrieves chunks → LangChain/LLM writes the answer |
 
 ---
 
@@ -175,9 +184,10 @@ Track progress by changing `[ ]` to `[x]` as you complete each item.
 | 2026-07-14 | Phase 1: POST /chat, CORS, .env, HTTPException, SSE stream | Echo + fake token stream before LLM |
 | 2026-07-14 | Phase 2: Groq chain, astream, session memory | Remember name across turns |
 | 2026-07-14 | Phase 3 core: POST /rag + sources + comments | First call slow; edit .md needs index rebuild |
+| 2026-07-14 | POST /rag/rebuild + Phase 4 split notes | LangChain=chat; LlamaIndex=docs |
 
 ---
 
 ## Current focus
 
-> Added POST /rag/rebuild — next recommended: Phase 4 (LangChain vs LlamaIndex mental model)
+> Phase 4 concepts done — optional hybrid endpoint later; next big step is Phase 5 (wire Next.js → FastAPI) or tools

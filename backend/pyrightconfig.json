@@ -2,7 +2,9 @@
   "venvPath": ".",
   "venv": ".venv",
   "pythonVersion": "3.10",
+  "pythonPlatform": "Linux",
   "extraPaths": [
     ".venv/lib/python3.10/site-packages"
-  ]
+  ],
+  "reportMissingImports": "warning"
 }

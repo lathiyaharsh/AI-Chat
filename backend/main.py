@@ -1,10 +1,10 @@
 """
 AI Chat Learning Backend
 
-Phases covered in this file:
-  Phase 1 — FastAPI (routes, Pydantic, CORS, .env, SSE)
-  Phase 2 — LangChain + Groq (chat, streaming, session memory, reply style)
-  Phase 3 — LlamaIndex RAG (ask questions over files in ./data)
+What this file does:
+  - FastAPI HTTP API (routes, validation, CORS, SSE)
+  - LangChain + Groq for chat (/chat, /chat/stream, session memory)
+  - LlamaIndex RAG over ./data (/rag) with vectors in Supabase pgvector
 
 Run (from backend/, with venv active):
   uvicorn main:app --reload --host 127.0.0.1 --port 8000
@@ -12,61 +12,194 @@ Run (from backend/, with venv active):
 """
 
 import os
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SecretStr
 
-# LangChain — chat / tools / memory orchestration
+# --- LangChain: orchestrates chat, prompts, memory ---
 from langchain_groq import ChatGroq
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-# LlamaIndex — document load → embed → index → retrieve (RAG)
-from llama_index.core import SimpleDirectoryReader, VectorStoreIndex, Settings
+# --- LlamaIndex: load docs → embed → search → answer (RAG) ---
+from llama_index.core import (
+    SimpleDirectoryReader,
+    VectorStoreIndex,
+    Settings,
+    StorageContext,
+)
 from llama_index.llms.groq import Groq
-from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+# Cloud embeddings via HF Inference API (no local torch ~2GB)
+from llama_index.embeddings.huggingface_api import HuggingFaceInferenceAPIEmbedding
+# Persist vectors in Supabase Postgres (pgvector) instead of RAM only
+from llama_index.vector_stores.supabase import SupabaseVectorStore
+import vecs  # low-level client used to delete collections on rebuild
 
-# ---------------------------------------------------------------------------
-# Config — secrets live in backend/.env (never commit real keys)
-# ---------------------------------------------------------------------------
+# =============================================================================
+# CONFIG — read secrets from backend/.env (never commit .env)
+# =============================================================================
 load_dotenv()
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
-# Folder of markdown files used for RAG (lab-secret.md, project-notes.md, …)
+HUGGINGFACE_API_KEY = os.getenv("HUGGINGFACE_API_KEY", "")
+HF_EMBED_MODEL = os.getenv("HF_EMBED_MODEL", "BAAI/bge-small-en-v1.5")
+# Embedding vector length — must match Supabase collection dimension (384 for bge-small)
+HF_EMBED_DIM = int(os.getenv("HF_EMBED_DIM", "384"))
+
+# Supabase Postgres URI — use postgresql:// (not postgres://)
+# Dashboard → Connect → copy URI (Session pooler recommended)
+SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL", "")
+# Table name inside schema "vecs" — visible in Supabase as vecs.ai_chat_docs
+SUPABASE_COLLECTION = os.getenv("SUPABASE_COLLECTION", "ai_chat_docs")
+
+# Markdown files for RAG (lab-secret.md, project-notes.md, …)
 DATA_DIR = Path(__file__).parent / "data"
 
-# Cached vector index. Built once on first /rag call, reused after that.
-# Editing files in DATA_DIR does NOT update this until you restart the
-# server (or clear rag_index and rebuild).
+# Cached LlamaIndex handle in this Python process (vectors themselves live in Supabase)
 rag_index: VectorStoreIndex | None = None
 
-# In-memory chat history for LangChain sessions.
-# Shape: { "session_id": [HumanMessage, AIMessage, HumanMessage, AIMessage, ...] }
-# Lost when the process restarts — fine for learning.
+# Chat memory: session_id → list of HumanMessage / AIMessage (lost on server restart)
 chat_sessions: dict[str, list] = {}
 
 
-# ---------------------------------------------------------------------------
-# LlamaIndex RAG helpers
-# ---------------------------------------------------------------------------
+# =============================================================================
+# RAG HELPERS — Supabase pgvector + LlamaIndex
+# =============================================================================
+def _normalize_pg_url(url: str) -> str:
+    """
+    Fix Supabase connection strings for psycopg2 / vecs.
+
+    Two common problems:
+      1. Supabase gives postgres:// but SQLAlchemy wants postgresql://
+      2. Passwords with @ # % * break URL parsing unless encoded
+    """
+    from urllib.parse import quote_plus, unquote
+
+    url = (url or "").strip().strip('"').strip("'")
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://") :]
+
+    if "://" not in url:
+        return url
+
+    scheme, rest = url.split("://", 1)
+    # Split on the LAST @ — password itself may contain @
+    if "@" not in rest:
+        return f"{scheme}://{rest}"
+
+    userinfo, hostpart = rest.rsplit("@", 1)
+    if ":" not in userinfo:
+        return f"{scheme}://{userinfo}@{hostpart}"
+
+    user, password = userinfo.split(":", 1)
+    password_enc = quote_plus(unquote(password))
+    return f"{scheme}://{user}:{password_enc}@{hostpart}"
+
+
+def _configure_llm_and_embeddings() -> None:
+    """Set global LlamaIndex defaults used by RAG query + ingest."""
+    # Groq answers the final question after retrieval
+    Settings.llm = Groq(api_key=GROQ_API_KEY, model=GROQ_MODEL)
+    # HF Inference API turns text chunks into vectors (remote, no torch)
+    Settings.embed_model = HuggingFaceInferenceAPIEmbedding(
+        model_name=HF_EMBED_MODEL,
+        token=HUGGINGFACE_API_KEY,
+        timeout=60.0,
+        pooling=None,
+    )
+
+
+def _delete_supabase_collection() -> None:
+    """Drop vecs.ai_chat_docs so rebuild starts fresh (used by /rag/rebuild)."""
+    client = vecs.create_client(_normalize_pg_url(SUPABASE_DB_URL))
+    try:
+        client.delete_collection(SUPABASE_COLLECTION)
+    except Exception:
+        pass  # OK if collection never existed
+    finally:
+        try:
+            client.disconnect()
+        except Exception:
+            pass
+
+
+def _make_vector_store() -> SupabaseVectorStore:
+    """Connect LlamaIndex to the Supabase pgvector collection."""
+    return SupabaseVectorStore(
+        postgres_connection_string=_normalize_pg_url(SUPABASE_DB_URL),
+        collection_name=SUPABASE_COLLECTION,
+        dimension=HF_EMBED_DIM,
+    )
+
+
+def _collection_is_empty(vector_store: SupabaseVectorStore) -> bool:
+    """True = first run → we need to embed docs and write to Supabase."""
+    try:
+        collection = vector_store._collection
+        if collection is None:
+            return True
+        rows = collection.query(
+            data=[0.0] * HF_EMBED_DIM,
+            limit=1,
+            include_value=False,
+            include_metadata=False,
+        )
+        return len(rows) == 0
+    except Exception:
+        return True
+
+
+def _build_rag_index(*, force_rebuild: bool = False) -> VectorStoreIndex:
+    """
+    Build or load the RAG index.
+
+    Flow:
+      force_rebuild → delete old collection
+      collection empty → read DATA_DIR, embed via HF API, upsert to Supabase
+      collection has rows → load from Supabase (fast, survives restart)
+    """
+    _configure_llm_and_embeddings()
+
+    if force_rebuild:
+        _delete_supabase_collection()
+
+    vector_store = _make_vector_store()
+    storage_context = StorageContext.from_defaults(vector_store=vector_store)
+
+    needs_ingest = force_rebuild or _collection_is_empty(vector_store)
+    if not needs_ingest:
+        # Vectors already in Supabase — just attach the index to them
+        return VectorStoreIndex.from_vector_store(vector_store)
+
+    # Load all files under backend/data/
+    docs = SimpleDirectoryReader(str(DATA_DIR)).load_data()
+
+    # HF Inference API can return transient 500s — retry a few times
+    last_error: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            return VectorStoreIndex.from_documents(
+                docs, storage_context=storage_context
+            )
+        except Exception as exc:
+            last_error = exc
+            if attempt < 3:
+                time.sleep(1.5 * attempt)
+    assert last_error is not None
+    raise last_error
+
+
 def get_rag_index(*, force_rebuild: bool = False) -> VectorStoreIndex:
     """
-    Build (or return cached) vector index over DATA_DIR.
+    Return cached RAG index, building from Supabase on first use.
 
-    Steps on first call / rebuild (slower):
-      1. Configure Groq as the answer LLM
-      2. Configure local HuggingFace embeddings (text → vectors)
-      3. Load every file under data/
-      4. Chunk + embed documents into VectorStoreIndex
-
-    Later calls with force_rebuild=False return the cached `rag_index` (fast).
-
-    Pass force_rebuild=True after editing files in DATA_DIR so answers use new text.
+    Call with force_rebuild=True after editing files in DATA_DIR.
     """
     global rag_index
     if rag_index is not None and not force_rebuild:
@@ -75,42 +208,49 @@ def get_rag_index(*, force_rebuild: bool = False) -> VectorStoreIndex:
     if not GROQ_API_KEY or GROQ_API_KEY.startswith("your_"):
         raise HTTPException(status_code=500, detail="GROQ_API_KEY is not configured")
 
-    # Global LlamaIndex settings used by the query engine
-    Settings.llm = Groq(api_key=GROQ_API_KEY, model=GROQ_MODEL)
-    # Local embeddings = no OpenAI key needed, but first run may download the model
-    Settings.embed_model = HuggingFaceEmbedding(
-        model_name="BAAI/bge-small-en-v1.5"
-    )
+    if not HUGGINGFACE_API_KEY or HUGGINGFACE_API_KEY.startswith("your_"):
+        raise HTTPException(
+            status_code=500,
+            detail="HUGGINGFACE_API_KEY is not configured in backend/.env",
+        )
 
-    docs = SimpleDirectoryReader(str(DATA_DIR)).load_data()
-    rag_index = VectorStoreIndex.from_documents(docs)
+    if not SUPABASE_DB_URL or "your_" in SUPABASE_DB_URL or "<" in SUPABASE_DB_URL:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "SUPABASE_DB_URL is not configured. "
+                "Add your Supabase Postgres URI to backend/.env "
+                "(must start with postgresql://)."
+            ),
+        )
+
+    rag_index = _build_rag_index(force_rebuild=force_rebuild)
     return rag_index
 
 
-# ---------------------------------------------------------------------------
-# LangChain chat helpers
-# ---------------------------------------------------------------------------
+# =============================================================================
+# CHAT HELPERS — LangChain + Groq
+# =============================================================================
 def get_model() -> ChatGroq:
-    """Create a Groq chat model for LangChain /chat endpoints."""
+    """Create Groq chat model for /chat endpoints."""
     if not GROQ_API_KEY or GROQ_API_KEY.startswith("your_"):
         raise HTTPException(
             status_code=500,
             detail="GROQ_API_KEY is not configured in backend/.env",
         )
     return ChatGroq(
-        api_key=GROQ_API_KEY,
+        api_key=SecretStr(GROQ_API_KEY),
         model=GROQ_MODEL,
-        temperature=0.7,  # higher = more creative; lower = more focused
+        temperature=0.7,
     )
 
 
 def build_messages(session_id: str, message: str, reply_mode: str = "concise") -> list:
     """
-    Assemble the message list sent to the LLM:
-      [SystemMessage] + prior history + new HumanMessage
+    Build the message list Groq receives:
+      [SystemMessage] + past turns + new HumanMessage
 
-    reply_mode controls answer length via the system prompt
-    (same idea as Concise / Detailed on the Next.js UI).
+    reply_mode mirrors Next.js Concise / Detailed toggle.
     """
     history = chat_sessions.setdefault(session_id, [])
     style = (
@@ -126,19 +266,19 @@ def build_messages(session_id: str, message: str, reply_mode: str = "concise") -
 
 
 def remember(session_id: str, human: str, ai: str) -> None:
-    """Append this turn to session history; keep only the last 20 messages."""
+    """Save this turn so the next message in the same session has context."""
     history = chat_sessions.setdefault(session_id, [])
     history.append(HumanMessage(content=human))
     history.append(AIMessage(content=ai))
-    chat_sessions[session_id] = history[-20:]
+    chat_sessions[session_id] = history[-20:]  # cap context size
 
 
-# ---------------------------------------------------------------------------
-# FastAPI app
-# ---------------------------------------------------------------------------
+# =============================================================================
+# FASTAPI APP
+# =============================================================================
 app = FastAPI(title="AI Chat Learning Backend")
 
-# CORS: browsers block localhost:3000 → :8000 unless the API allows it
+# Allow browser calls from Next.js (localhost:3000 → localhost:8000)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -151,9 +291,9 @@ app.add_middleware(
 )
 
 
-# ---------------------------------------------------------------------------
-# Pydantic models = request/response schemas + automatic validation
-# ---------------------------------------------------------------------------
+# =============================================================================
+# REQUEST / RESPONSE MODELS (Pydantic validates JSON automatically)
+# =============================================================================
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=2000)
     session_id: str = Field(default="default", min_length=1, max_length=64)
@@ -170,12 +310,12 @@ class RagRequest(BaseModel):
 
 class RagResponse(BaseModel):
     answer: str
-    sources: list[str]  # short snippets of retrieved chunks (for debugging/learning)
+    sources: list[str]  # retrieved chunk snippets — helps you debug RAG
 
 
-# ---------------------------------------------------------------------------
-# Basic routes
-# ---------------------------------------------------------------------------
+# =============================================================================
+# ROUTES — basic
+# =============================================================================
 @app.get("/")
 def root():
     return {"message": "Hello from FastAPI! Open /docs to try the API."}
@@ -183,21 +323,32 @@ def root():
 
 @app.get("/health")
 def health():
-    """Liveness check — never return the real API key, only whether it is set."""
+    """Quick check that keys are set — never returns actual secret values."""
     return {
         "status": "ok",
         "groq_key_configured": bool(
             GROQ_API_KEY and not GROQ_API_KEY.startswith("your_")
         ),
+        "huggingface_key_configured": bool(
+            HUGGINGFACE_API_KEY and not HUGGINGFACE_API_KEY.startswith("your_")
+        ),
+        "supabase_configured": bool(
+            SUPABASE_DB_URL
+            and "your_" not in SUPABASE_DB_URL
+            and "<" not in SUPABASE_DB_URL
+        ),
         "groq_model": GROQ_MODEL,
+        "hf_embed_model": HF_EMBED_MODEL,
+        "supabase_collection": SUPABASE_COLLECTION,
     }
 
 
-# ---------------------------------------------------------------------------
-# LangChain chat — full reply (invoke waits for the complete answer)
-# ---------------------------------------------------------------------------
+# =============================================================================
+# ROUTES — chat (LangChain)
+# =============================================================================
 @app.post("/chat", response_model=ChatResponse)
 def chat(request: ChatRequest):
+    """Full reply in one JSON response (invoke = wait for complete answer)."""
     message = request.message.strip()
     if not message:
         raise HTTPException(status_code=400, detail="Message cannot be empty.")
@@ -207,7 +358,6 @@ def chat(request: ChatRequest):
         messages = build_messages(
             request.session_id, message, request.reply_mode
         )
-        # invoke() → one AIMessage when generation finishes
         ai_message = model.invoke(messages)
         reply = (
             ai_message.content
@@ -223,12 +373,13 @@ def chat(request: ChatRequest):
     return ChatResponse(reply=reply)
 
 
-# ---------------------------------------------------------------------------
-# LangChain chat — SSE stream (astream yields tokens as they arrive)
-# SSE format: each event is "data: <text>\n\n", then "data: [DONE]\n\n"
-# ---------------------------------------------------------------------------
 @app.post("/chat/stream")
 async def chat_stream(request: ChatRequest):
+    """
+    Stream tokens over SSE as Groq generates them.
+
+    Event format: data: <chunk>\\n\\n  then  data: [DONE]\\n\\n
+  """
     message = request.message.strip()
     if not message:
         raise HTTPException(status_code=400, detail="Message cannot be empty.")
@@ -248,8 +399,7 @@ async def chat_stream(request: ChatRequest):
                 text = chunk.content if isinstance(chunk.content, str) else ""
                 if text:
                     parts.append(text)
-                    # Keep SSE as one line per event (newlines would break framing)
-                    safe = text.replace("\n", "\\n")
+                    safe = text.replace("\n", "\\n")  # keep SSE one-line per event
                     yield f"data: {safe}\n\n"
             remember(request.session_id, message, "".join(parts))
             yield "data: [DONE]\n\n"
@@ -261,17 +411,17 @@ async def chat_stream(request: ChatRequest):
 
 @app.delete("/chat/session/{session_id}")
 def clear_session(session_id: str):
-    """Forget conversation history for one session_id."""
+    """Clear in-memory chat history for one session."""
     chat_sessions.pop(session_id, None)
     return {"cleared": session_id}
 
 
-# ---------------------------------------------------------------------------
-# LlamaIndex RAG — question over ./data documents
+# =============================================================================
+# ROUTES — RAG (LlamaIndex + Supabase)
 #
-# Flow: question → embed → find top-k similar chunks → LLM answers from them
-# Test: {"question": "What is the fridge password?"} → expect password from lab-secret.md
-# ---------------------------------------------------------------------------
+# Flow: question → embed → search Supabase → top chunks → Groq answer
+# Test: {"question": "What is the fridge password?"} → BANANA-42 from lab-secret.md
+# =============================================================================
 @app.post("/rag", response_model=RagResponse)
 def rag(request: RagRequest):
     question = request.question.strip()
@@ -280,11 +430,10 @@ def rag(request: RagRequest):
 
     try:
         index = get_rag_index()
-        # similarity_top_k = how many retrieved chunks to pass to the LLM
+        # top_k = how many document chunks to pass to the LLM
         engine = index.as_query_engine(similarity_top_k=3)
         result = engine.query(question)
 
-        # Expose retrieved text so you can see what grounded the answer
         sources: list[str] = []
         for node in getattr(result, "source_nodes", []) or []:
             text = node.get_content()
@@ -300,16 +449,18 @@ def rag(request: RagRequest):
 @app.post("/rag/rebuild")
 def rag_rebuild():
     """
-    Re-read backend/data/ and rebuild the vector index.
+    Re-embed everything in backend/data/ and write fresh vectors to Supabase.
 
-    Use this after editing .md files so /rag sees the new content
-    without restarting uvicorn.
+    Call this after editing .md files (no server restart needed).
+    View result in Supabase: schema vecs → table ai_chat_docs
     """
     try:
         get_rag_index(force_rebuild=True)
         file_count = len(list(DATA_DIR.glob("*"))) if DATA_DIR.exists() else 0
         return {
             "status": "rebuilt",
+            "vector_store": "supabase_pgvector",
+            "collection": SUPABASE_COLLECTION,
             "data_dir": str(DATA_DIR),
             "files_seen": file_count,
         }
